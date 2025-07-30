@@ -30,20 +30,13 @@ JOURNAL_IMPACT_CSV_URL = "https://raw.githubusercontent.com/WandLZhang/scimagojr
 REQUIRED_APIS = ["aiplatform.googleapis.com", "bigquery.googleapis.com", "cloudresourcemanager.googleapis.com"]
 CREATE_BILLING_ACCOUNT_URL = "https://console.cloud.google.com/billing/create?inv=1&invt=Ab4E_Q"
 CREATE_BILLING_ACCOUNT_OPTION = "→ Create New Billing Account"
-SAMPLE_CASE = """A 4-year-old male presents with a 3-week history of progressive fatigue, pallor, and easy bruising. \n
-Physical examination reveals hepatosplenomegaly and scattered petechiae. \n
-\n
-Laboratory findings:\n
-- WBC: 45,000/μL with 80% blasts\n
-- Hemoglobin: 7.2 g/dL\n
-- Platelets: 32,000/μL\n
-\n
-Flow cytometry: CD33+, CD13+, CD117+, CD34+, HLA-DR+, CD19-, CD3-\n
-\n
-Cytogenetics: 46,XY,t(9;11)(p21.3;q23.3)\n
-Molecular: KMT2A-MLLT3 fusion detected, FLT3-ITD positive, NRAS G12D mutation\n
-\n
-Diagnosis: KMT2A-rearranged acute myeloid leukemia (AML)"""
+SAMPLE_CASE = """A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO DBH AML 2012 protocol. Post- MEC and ADE, MRD remained at 35% and 53%. Vyxeos-clofarabine therapy reduced MRD to 18%. Third-line FLAG-Mylotarg lowered MRD to 3.5% (flow) and 1% (molecular). After a cord blood HSCT in December 2022, she relapsed 10 months later with 3% MRD and femoral extramedullary disease.
+After the iLTB discussion, in November 2023 the patient was enrolled in the SNDX5613 trial, receiving revumenib for three months, leading to a reduction in KMT2A MRD to 0.1% by PCR. Subsequently, the patient underwent a second allogeneic HSCT using cord blood with treosulfan, thiotepa, and fludarabine conditioning, followed by revumenib maintenance. In August 2024, 6.5 months after the second HSCT, the patient experienced a bone marrow relapse with 33% blasts. The patient is currently in very good clinical condition.
+
+Diagnostic tests:			
+WES and RNAseq were performed on the 1st relapse sample showing KMT2A::MLLT3 fusion and NRAS (p.Gln61Lys) mutation.
+Flow cytometry from the current relapse showed positive CD33 and CD123.
+WES and RNAseq of the current relapse sample is pending."""
 
 # --- Global Variables ---
 genai_client, bq_client = None, None
@@ -60,6 +53,75 @@ SCORING_PRESETS = {
         "clinical_trial": 40
     }
 }
+
+# Disease extraction prompt from gemini-medical-literature
+DISEASE_EXTRACTION_PROMPT = """You are an expert pediatric oncologist and chair of the International Leukemia Tumor Board (iLTB). Your role is to analyze patient case notes and identify the primary disease being discussed.
+
+Input: Patient case notes, as provided by a clinician. This will include information on diagnosis, treatment history, and relevant diagnostic findings.
+
+Task:
+
+Disease Extraction:
+
+Carefully analyze the patient case notes.
+
+Identify the primary disease the patient is diagnosed with and/or being treated for. Extract this disease name exactly as it is written in the notes. It should be the initial diagnosis.
+
+Example:
+
+Case Note Input: "A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO DBH AML 2012 protocol..."
+Output: AML
+
+Case Note Input: "18 y/o boy, diagnosed in November 2021 with T-ALL with CNS1, without any extramedullary disease. Was treated according to ALLTogether protocol..."
+Output: T-ALL
+
+Case Note Input: "A 10-year-old patient with relapsed B-cell acute lymphoblastic leukemia (B-ALL) presented..."
+Output: B-cell acute lymphoblastic leukemia (B-ALL)
+
+Extract the disease from the provided patient information. Only output the disease name, exactly as it is written in the case notes. Do not include any other text or formatting.
+
+Case notes:"""
+
+# Events extraction prompt from gemini-medical-literature
+EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist and chair of the International Leukemia Tumor Board (iLTB). Your role is to analyze complex patient case notes, identify key actionable events that may guide treatment strategies, and formulate precise search queries for PubMed to retrieve relevant clinical research articles.
+
+**Input:** Patient case notes, as provided by a clinician. This will include information on diagnosis, treatment history, and relevant diagnostic findings including genetics and flow cytometry results.
+
+**Task:**
+
+1. **Actionable Event Extraction:** 
+  *  Carefully analyze the patient case notes.
+  *  Identify and extract all clinically relevant and actionable events, such as:
+    *  **Specific genetic mutations or fusions:** For example, "KMT2A::MLLT3 fusion", "NRAS (p.Gln61Lys) mutation"
+    *  **Immunophenotype data:** For example, "positive CD33", "positive CD123"
+    *  **Disease status:** For example, "relapsed after HSCT", "refractory to protocol"
+    *  **Specific therapies:** "revumenib", "FLAG-Mylotarg", "Vyxeos-clofarabine"
+    *  **Disease location:** For example, "CNS2 involvement", "femoral extramedullary disease"
+    *  **Response to therapy:** For example, "MRD reduction to 0.1%"
+    *  **Treatment resistance:** For example, "relapsed after second HSCT"
+   *  Focus on information that is directly relevant to potential therapy selection or clinical management. Avoid vague or redundant information like "very good clinical condition". 
+   
+**Example:**
+
+*  **Case Note Input:** "A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO DBH AML 2012 protocol. Post- MEC and ADE, MRD remained at 35% and 53%. Vyxeos-clofarabine therapy reduced MRD to 18%. Third-line FLAG-Mylotarg lowered MRD to 3.5% (flow) and 1% (molecular). After a cord blood HSCT in December 2022, she relapsed 10 months later with 3% MRD and femoral extramedullary disease.
+After the iLTB discussion, in November 2023 the patient was enrolled in the SNDX5613 trial, receiving revumenib for three months, leading to a reduction in KMT2A MRD to 0.1% by PCR. Subsequently, the patient underwent a second allogeneic HSCT using cord blood with treosulfan, thiotepa, and fludarabine conditioning, followed by revumenib maintenance. In August 2024, 6.5 months after the second HSCT, the patient experienced a bone marrow relapse with 33% blasts. The patient is currently in very good clinical condition.             
+Diagnostic tests:                                                     
+WES and RNAseq were performed on the 1st relapse sample showing KMT2A::MLLT3 fusion and NRAS (p.Gln61Lys) mutation.
+Flow cytometry from the current relapse showed positive CD33 and CD123.
+WES and RNAseq of the current relapse sample is pending. "
+
+**Output:**  
+"KMT2A::MLLT3 fusion" "NRAS" "CD33" "CD123"
+
+**Reasoning and Guidance:**
+
+*  **Focus on Actionable Events:** We are not trying to summarize the case but to find what information is relevant to decision-making. This helps filter noise and focus on clinically significant findings.
+*  **Prioritization:** Starting with pediatric studies ensures that we tailor our searches to the specific patient population.
+*  **Specific Search Terms:** Using exact terms such as "KMT2A::MLLT3 fusion" is essential for precision. Adding "therapy", "treatment" or "clinical trials" helps to find relevant studies.
+*  **Combinations:** Combining genetic and immunophenotypic features allows for refined searches that might be more relevant to the patient.
+*  **Iteration:** If initial search results are not helpful, we can modify and refine the queries based on the available data.
+
+Extract actionable events from the provided patient information, such as gene fusions, mutations, and positive markers.  Only output the list of actionable events. Do not include any other text or formatting."""
 
 # --- Helper Functions for Enhanced Setup ---
 def get_user_credentials_from_gcloud():
@@ -311,15 +373,19 @@ def load_journal_data():
         return {}
 
 def extract_medical_info(case_text, client):
-    prompts = {
-        "disease": "Extract the primary disease diagnosis. Return ONLY the name.",
-        "events": "Extract all actionable medical events (mutations, biomarkers, etc.). Return a comma-separated list."
-    }
+    """Extract medical information using sophisticated prompts from gemini-medical-literature."""
     results = {}
-    for key, prompt in prompts.items():
-        full_prompt = f"{prompt}\n\nCase notes:\n{case_text}"
-        response = client.models.generate_content(model=MODEL_ID, contents=[full_prompt], config=GenerateContentConfig(temperature=0))
-        results[key] = response.text.strip()
+    
+    # Extract disease using the sophisticated prompt
+    disease_prompt = f"{DISEASE_EXTRACTION_PROMPT}\n\n{case_text}"
+    response = client.models.generate_content(model=MODEL_ID, contents=[disease_prompt], config=GenerateContentConfig(temperature=0))
+    results["disease"] = response.text.strip()
+    
+    # Extract events using the sophisticated prompt
+    events_prompt = f"{EVENT_EXTRACTION_PROMPT}\n\n{case_text}"
+    response = client.models.generate_content(model=MODEL_ID, contents=[events_prompt], config=GenerateContentConfig(temperature=0))
+    results["events"] = response.text.strip()
+    
     return results
 
 def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_table, top_k):
@@ -608,6 +674,19 @@ def create_app(share=False):
         font-size: 0.9em;
         color: #666;
     }
+    .extraction-result {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        padding: 15px;
+        margin: 10px 0;
+        font-family: monospace;
+        white-space: pre-wrap;
+        color: #212529 !important;  /* Ensure dark text */
+    }
+    .extraction-result * {
+        color: #212529 !important;  /* Ensure all child elements have dark text */
+    }
     """
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="sky"), css=css) as demo:
         gr.Markdown("# 🏥 PubMed Literature Analysis")
@@ -675,6 +754,23 @@ def create_app(share=False):
                     lines=10,
                     placeholder="Enter patient case details here..."
                 )
+                
+                # Extract Information section
+                gr.Markdown("---")
+                
+                with gr.Column():
+                    # Extract button
+                    extract_btn = gr.Button("Extract Information", variant="secondary")
+                    
+                    # Info text inline
+                    gr.Markdown("#### Extract Information <span style='color: #666; font-size: 0.85em; font-weight: normal; margin-left: 10px;'>This will help the BigQuery vector search be more refined</span>", visible=False, elem_id="extract_info_header")
+                    
+                    # Extraction results box
+                    with gr.Column(visible=False) as extraction_box:
+                        extraction_display = gr.Markdown("")
+                    
+                    # Store extraction state
+                    extraction_state = gr.State({"extracted": False, "disease": "", "events": ""})
                 
                 # Hidden slider - keeps default value of 10
                 num_articles_slider = gr.Slider(
@@ -974,7 +1070,69 @@ def create_app(share=False):
         )
 
         # Case Tab Interactions
-        # Enable/disable proceed button based on case input
+        def extract_and_display(case_text):
+            """Extract medical information and display results."""
+            if not case_text.strip():
+                return (
+                    gr.update(visible=True),  # extract_info_header
+                    gr.update(visible=False),  # extraction_box
+                    "",  # extraction_display
+                    {"extracted": False, "disease": "", "events": ""},  # extraction_state
+                    gr.update(interactive=False),  # proceed_button
+                    "❌ Please enter case notes first."  # case_status
+                )
+            
+            if not genai_client:
+                return (
+                    gr.update(visible=True),
+                    gr.update(visible=True),
+                    "❌ Please complete setup first.",
+                    {"extracted": False, "disease": "", "events": ""},
+                    gr.update(interactive=False),
+                    ""
+                )
+            
+            try:
+                # Extract medical info
+                medical_info = extract_medical_info(case_text, genai_client)
+                disease = medical_info.get('disease', '')
+                events = medical_info.get('events', '')
+                
+                # Format display with raw Gemini output
+                display_text = f"""<div class="extraction-result">
+<strong>Disease:</strong> {disease}
+
+<strong>Actionable Events:</strong>
+{events}
+</div>"""
+                
+                return (
+                    gr.update(visible=True),  # extract_info_header
+                    gr.update(visible=True),  # extraction_box
+                    display_text,  # extraction_display
+                    {"extracted": True, "disease": disease, "events": events},  # extraction_state
+                    gr.update(interactive=True),  # proceed_button
+                    "✅ Information extracted successfully."  # case_status
+                )
+                
+            except Exception as e:
+                return (
+                    gr.update(visible=True),
+                    gr.update(visible=True),
+                    f"❌ Error extracting information: {str(e)}",
+                    {"extracted": False, "disease": "", "events": ""},
+                    gr.update(interactive=False),
+                    ""
+                )
+        
+        # Extract button click handler
+        extract_btn.click(
+            extract_and_display,
+            inputs=[case_input],
+            outputs=[gr.Markdown(elem_id="extract_info_header"), extraction_box, extraction_display, extraction_state, proceed_to_persona_btn, case_status]
+        )
+        
+        # Enable/disable extract button based on case input
         def check_case_input(case_text):
             if case_text.strip():
                 return gr.update(interactive=True)
@@ -984,27 +1142,29 @@ def create_app(share=False):
         case_input.change(
             check_case_input,
             inputs=[case_input],
-            outputs=[proceed_to_persona_btn]
+            outputs=[extract_btn]
         )
         
         # Load example button handler
         def load_example_case():
-            return SAMPLE_CASE, gr.update(interactive=True)
+            return SAMPLE_CASE
 
         load_example_btn.click(
             load_example_case,
-            outputs=[case_input, proceed_to_persona_btn]
+            outputs=[case_input]
         )
 
         # Modified proceed button handler to go to Persona tab
-        def proceed_to_persona(case_text):
+        def proceed_to_persona(case_text, extraction_state):
             if not case_text.strip():
                 return "❌ Please enter case notes first.", gr.update(interactive=False), gr.update()
-            return "✅ Case notes saved. Please customize your persona.", gr.update(interactive=True), gr.update(selected=3)
+            if not extraction_state.get("extracted", False):
+                return "❌ Please wait for information extraction to complete.", gr.update(interactive=False), gr.update()
+            return "✅ Case notes and extracted information saved. Please customize your persona.", gr.update(interactive=True), gr.update(selected=3)
 
         proceed_to_persona_btn.click(
             proceed_to_persona,
-            inputs=[case_input],
+            inputs=[case_input, extraction_state],
             outputs=[case_status, analyze_btn, tabs]
         )
 
@@ -1025,15 +1185,15 @@ def create_app(share=False):
         DEFAULT_CRITERIA = [
             {"name": "disease_match", "description": "Does the article match the patient's disease?", "weight": 50, "type": "boolean", "deletable": True},
             {"name": "treatment_shown", "description": "Does the article show positive treatment results?", "weight": 50, "type": "boolean", "deletable": True},
-            {"name": "pediatric_focus", "description": "Does the article focus on pediatric patients?", "weight": 20, "type": "boolean", "deletable": True},
-            {"name": "clinical_trial", "description": "Is this a clinical trial?", "weight": 40, "type": "boolean", "deletable": True},
-            {"name": "novelty", "description": "Does the article present novel findings?", "weight": 10, "type": "boolean", "deletable": True},
-            {"name": "actionable_events_match", "description": "How many actionable events from the patient's case are mentioned in this article?", "weight": 15, "type": "direct", "deletable": True},
-            {"name": "human_clinical_data", "description": "Does the article include human clinical data?", "weight": 15, "type": "boolean", "deletable": True},
+            {"name": "pediatric_focus", "description": "Does the article focus on pediatric patients?", "weight": 60, "type": "boolean", "deletable": True},
+            {"name": "clinical_trial", "description": "Is this a clinical trial?", "weight": 70, "type": "boolean", "deletable": True},
+            {"name": "novelty", "description": "Does the article present novel findings?", "weight": 65, "type": "boolean", "deletable": True},
+            {"name": "actionable_events_match", "description": "How many actionable events from the patient's case are mentioned in this article?", "weight": 85, "type": "direct", "deletable": True},
+            {"name": "human_clinical_data", "description": "Does the article include human clinical data?", "weight": 30, "type": "boolean", "deletable": True},
             {"name": "cell_studies", "description": "Does the article include cell studies?", "weight": 5, "type": "boolean", "deletable": True},
             {"name": "mice_studies", "description": "Does the article include mice studies?", "weight": 10, "type": "boolean", "deletable": True},
             {"name": "journal_impact", "description": "Journal impact factor (SJR)", "weight": 25, "type": "special_journal", "deletable": True},
-            {"name": "year", "description": "Publication year penalty", "weight": 1, "type": "special_year", "deletable": True}
+            {"name": "year", "description": "Publication year penalty", "weight": 20, "type": "special_year", "deletable": True}
         ]
         
         def calculate_total_weight(criteria_list):

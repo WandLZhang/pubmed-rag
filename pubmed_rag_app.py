@@ -731,9 +731,37 @@ def create_app(share=False):
                     # Total weight display
                     total_weight_display = gr.Markdown("**Total Weight:** 0")
                     
-                    # Hidden components for interaction
-                    criterion_action = gr.Textbox(visible=False)
-                    criterion_data = gr.JSON(visible=False)
+                    # Add criterion dialog
+                    with gr.Column(visible=False) as add_criterion_dialog:
+                        gr.Markdown("### Add New Scoring Criterion")
+                        new_criterion_description = gr.Textbox(
+                            label="Description",
+                            placeholder="e.g., Does the article include safety data?",
+                            lines=2
+                        )
+                        new_criterion_type = gr.Dropdown(
+                            label="Type",
+                            choices=["boolean", "numeric", "direct"],
+                            value="boolean",
+                            info="Boolean: Yes/No criteria | Numeric: Multiplies value by weight | Direct: Uses value as-is"
+                        )
+                        new_criterion_weight = gr.Slider(
+                            label="Weight",
+                            minimum=0,
+                            maximum=100,
+                            value=10,
+                            step=1
+                        )
+                        with gr.Row():
+                            confirm_add_btn = gr.Button("Add", variant="primary", size="sm")
+                            cancel_add_btn = gr.Button("Cancel", size="sm")
+                    
+                    # Hidden components for interaction - create one for each possible criterion
+                    weight_inputs = []
+                    delete_inputs = []
+                    for i in range(20):  # Support up to 20 criteria
+                        weight_inputs.append(gr.Textbox(visible=False, elem_id=f"weight-input-{i}"))
+                        delete_inputs.append(gr.Textbox(visible=False, elem_id=f"delete-input-{i}"))
                     
                 analyze_btn = gr.Button("Run Full Analysis", variant="primary", interactive=False)
                 analysis_status = gr.Markdown()
@@ -1001,10 +1029,10 @@ def create_app(share=False):
                 type_color = type_colors.get(criterion['type'], '#607D8B')
                 
                 html += f'''
-                <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; background: #fafafa;">
+                <div style="border: 1px solid #d0d5dd; border-radius: 8px; padding: 15px; background: #e8eaf0;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                         <div style="flex: 1;">
-                            <strong style="font-size: 16px;">{criterion['description']}</strong>
+                            <strong style="font-size: 16px; color: #1f2937;">{criterion['description']}</strong>
                             <div style="margin-top: 5px;">
                                 <span style="background: {type_color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-right: 8px;">
                                     {criterion['type']}
@@ -1015,15 +1043,21 @@ def create_app(share=False):
                     </div>
                     <div style="display: flex; align-items: center; gap: 16px;">
                         <div style="flex: 1;">
-                            <label style="font-size: 14px; color: #666;">Weight: <strong>{criterion['weight']}</strong></label>
+                            <label style="font-size: 14px; color: #666;">Weight: <strong id="weight-{idx}">{criterion['weight']}</strong></label>
                             <input type="range" min="0" max="100" value="{criterion['weight']}" 
                                    style="width: 100%; margin-top: 5px;"
-                                   onchange="window.updateCriterionWeight({idx}, this.value)">
+                                   oninput="document.getElementById('weight-{idx}').textContent = this.value; 
+                                            document.getElementById('weight-input-{idx}').value = this.value;
+                                            document.getElementById('weight-input-{idx}').dispatchEvent(new Event('input'));"
+                                   id="slider-{idx}">
                         </div>
-                        <button style="background: {'#ccc' if not deletable else '#f44336'}; color: white; border: none; 
+                        <button style="background: {'#9ca3af' if not deletable else '#ef4444'}; color: white; border: none; 
                                        padding: 6px 12px; border-radius: 4px; cursor: {'not-allowed' if not deletable else 'pointer'}; 
                                        font-size: 14px;"
-                                onclick="window.deleteCriterion({idx})"
+                                onclick="if ({str(deletable).lower()}) {{ 
+                                    document.getElementById('delete-input-{idx}').value = 'delete'; 
+                                    document.getElementById('delete-input-{idx}').dispatchEvent(new Event('input')); 
+                                }}"
                                 {'disabled' if not deletable else ''}>
                             🗑️ Delete
                         </button>
@@ -1033,19 +1067,12 @@ def create_app(share=False):
             
             html += '</div>'
             
-            # Add JavaScript for interaction
-            html += '''
-            <script>
-                window.updateCriterionWeight = function(idx, value) {
-                    // This will be handled by Gradio event
-                    console.log('Update weight:', idx, value);
-                };
-                window.deleteCriterion = function(idx) {
-                    // This will be handled by Gradio event
-                    console.log('Delete criterion:', idx);
-                };
-            </script>
-            '''
+            # Add hidden inputs for each criterion
+            html += '<div style="display: none;">'
+            for idx in range(len(criteria_list)):
+                html += f'<input type="text" id="weight-input-{idx}" value="">'
+                html += f'<input type="text" id="delete-input-{idx}" value="">'
+            html += '</div>'
             
             return html
         
@@ -1056,28 +1083,48 @@ def create_app(share=False):
         
         def update_criterion_weight(criteria_list, idx, new_weight):
             """Update weight for a specific criterion."""
-            if 0 <= idx < len(criteria_list):
-                criteria_list[idx]['weight'] = new_weight
-            return criteria_list, calculate_total_weight(criteria_list)
+            if new_weight and 0 <= idx < len(criteria_list):
+                try:
+                    criteria_list[idx]['weight'] = int(new_weight)
+                except ValueError:
+                    pass
+            return criteria_list, render_criteria_html(criteria_list), calculate_total_weight(criteria_list)
         
         def delete_criterion(criteria_list, idx):
             """Delete a criterion from the list."""
             if 0 <= idx < len(criteria_list) and criteria_list[idx].get('deletable', True):
                 criteria_list.pop(idx)
-            return criteria_list, calculate_total_weight(criteria_list)
+            return criteria_list, render_criteria_html(criteria_list), calculate_total_weight(criteria_list)
         
-        def add_new_criterion(criteria_list):
-            """Add a new custom criterion."""
+        def show_add_criterion_dialog():
+            """Show the dialog for adding a new criterion."""
+            return gr.update(visible=True)
+        
+        def hide_add_criterion_dialog():
+            """Hide the add criterion dialog."""
+            return gr.update(visible=False), "", "boolean", 10
+        
+        def add_new_criterion_with_details(criteria_list, description, criterion_type, weight):
+            """Add a new custom criterion with user-provided details."""
+            if not description.strip():
+                return criteria_list, render_criteria_html(criteria_list), calculate_total_weight(criteria_list), gr.update(visible=True)
+            
+            # Generate a safe name from description
+            import re
+            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', description.lower())[:30]
+            if not safe_name or safe_name[0].isdigit():
+                safe_name = f"custom_{len(criteria_list)}"
+            
             new_criterion = {
-                "name": f"custom_{len(criteria_list)}",
-                "description": "New custom criterion",
-                "weight": 10,
-                "type": "boolean",
+                "name": safe_name,
+                "description": description.strip(),
+                "weight": weight,
+                "type": criterion_type,
                 "deletable": True,
                 "user_defined": True
             }
             criteria_list.append(new_criterion)
-            return criteria_list, render_criteria_html(criteria_list), calculate_total_weight(criteria_list)
+            return criteria_list, render_criteria_html(criteria_list), calculate_total_weight(criteria_list), gr.update(visible=False)
         
         def reset_to_defaults():
             """Reset criteria to defaults."""
@@ -1096,15 +1143,45 @@ def create_app(share=False):
         
         # Criteria management event handlers
         add_criterion_btn.click(
-            add_new_criterion,
-            inputs=[criteria_state],
-            outputs=[criteria_state, criteria_display, total_weight_display]
+            show_add_criterion_dialog,
+            outputs=[add_criterion_dialog]
+        )
+        
+        cancel_add_btn.click(
+            hide_add_criterion_dialog,
+            outputs=[add_criterion_dialog, new_criterion_description, new_criterion_type, new_criterion_weight]
+        )
+        
+        confirm_add_btn.click(
+            add_new_criterion_with_details,
+            inputs=[criteria_state, new_criterion_description, new_criterion_type, new_criterion_weight],
+            outputs=[criteria_state, criteria_display, total_weight_display, add_criterion_dialog]
+        ).then(
+            lambda: ("", "boolean", 10),
+            outputs=[new_criterion_description, new_criterion_type, new_criterion_weight]
         )
         
         reset_criteria_btn.click(
             reset_to_defaults,
             outputs=[criteria_state, criteria_display, total_weight_display]
         )
+        
+        # Wire up weight and delete handlers for each input
+        for i in range(20):
+            weight_inputs[i].change(
+                lambda weight, idx=i: update_criterion_weight(criteria_state.value, idx, weight) if criteria_state.value else (criteria_state.value, render_criteria_html(criteria_state.value), calculate_total_weight(criteria_state.value)),
+                inputs=[weight_inputs[i]],
+                outputs=[criteria_state, criteria_display, total_weight_display]
+            )
+            
+            delete_inputs[i].change(
+                lambda action, idx=i: delete_criterion(criteria_state.value, idx) if action == "delete" and criteria_state.value else (criteria_state.value, render_criteria_html(criteria_state.value), calculate_total_weight(criteria_state.value)),
+                inputs=[delete_inputs[i]],
+                outputs=[criteria_state, criteria_display, total_weight_display]
+            ).then(
+                lambda: "",
+                outputs=[delete_inputs[i]]
+            )
         
         # Modified analyze button to use persona and criteria
         def run_analysis_with_persona(case_text, num_articles, persona, criteria, progress=gr.Progress()):

@@ -55,73 +55,39 @@ SCORING_PRESETS = {
 }
 
 # Disease extraction prompt from gemini-medical-literature
-DISEASE_EXTRACTION_PROMPT = """You are an expert pediatric oncologist and chair of the International Leukemia Tumor Board (iLTB). Your role is to analyze patient case notes and identify the primary disease being discussed.
+DISEASE_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify the primary disease.
 
-Input: Patient case notes, as provided by a clinician. This will include information on diagnosis, treatment history, and relevant diagnostic findings.
+Task: Extract the initial diagnosis exactly as written in the case notes.
 
-Task:
+Examples:
+- Input: "A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement..."
+  Output: AML
 
-Disease Extraction:
+- Input: "18 y/o boy, diagnosed in November 2021 with T-ALL with CNS1..."
+  Output: T-ALL
 
-Carefully analyze the patient case notes.
+- Input: "A 10-year-old patient with relapsed B-cell acute lymphoblastic leukemia (B-ALL)..."
+  Output: B-cell acute lymphoblastic leukemia (B-ALL)
 
-Identify the primary disease the patient is diagnosed with and/or being treated for. Extract this disease name exactly as it is written in the notes. It should be the initial diagnosis.
-
-Example:
-
-Case Note Input: "A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO DBH AML 2012 protocol..."
-Output: AML
-
-Case Note Input: "18 y/o boy, diagnosed in November 2021 with T-ALL with CNS1, without any extramedullary disease. Was treated according to ALLTogether protocol..."
-Output: T-ALL
-
-Case Note Input: "A 10-year-old patient with relapsed B-cell acute lymphoblastic leukemia (B-ALL) presented..."
-Output: B-cell acute lymphoblastic leukemia (B-ALL)
-
-Extract the disease from the provided patient information. Only output the disease name, exactly as it is written in the case notes. Do not include any other text or formatting.
-
-Case notes:"""
+Output only the disease name. No additional text or formatting.
+"""
 
 # Events extraction prompt from gemini-medical-literature
-EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist and chair of the International Leukemia Tumor Board (iLTB). Your role is to analyze complex patient case notes, identify key actionable events that may guide treatment strategies, and formulate precise search queries for PubMed to retrieve relevant clinical research articles.
+EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify actionable events for treatment decisions.
 
-**Input:** Patient case notes, as provided by a clinician. This will include information on diagnosis, treatment history, and relevant diagnostic findings including genetics and flow cytometry results.
+Task: Extract clinically relevant events including:
+- Genetic mutations/fusions (e.g., "KMT2A::MLLT3 fusion", "NRAS mutation")
+- Positive markers (e.g., "CD33", "CD123")
+- Disease status (e.g., "relapsed after HSCT", "refractory")
+- Specific therapies (e.g., "revumenib", "FLAG-Mylotarg")
+- Treatment responses (e.g., "MRD reduction to 0.1%")
 
-**Task:**
+Example:
+Input: "A 4-year-old female with KMT2A-rearranged AML...WES showed KMT2A::MLLT3 fusion and NRAS (p.Gln61Lys) mutation. Flow cytometry showed positive CD33 and CD123..."
+Output: "KMT2A::MLLT3 fusion" "NRAS" "CD33" "CD123"
 
-1. **Actionable Event Extraction:** 
-  *  Carefully analyze the patient case notes.
-  *  Identify and extract all clinically relevant and actionable events, such as:
-    *  **Specific genetic mutations or fusions:** For example, "KMT2A::MLLT3 fusion", "NRAS (p.Gln61Lys) mutation"
-    *  **Immunophenotype data:** For example, "positive CD33", "positive CD123"
-    *  **Disease status:** For example, "relapsed after HSCT", "refractory to protocol"
-    *  **Specific therapies:** "revumenib", "FLAG-Mylotarg", "Vyxeos-clofarabine"
-    *  **Disease location:** For example, "CNS2 involvement", "femoral extramedullary disease"
-    *  **Response to therapy:** For example, "MRD reduction to 0.1%"
-    *  **Treatment resistance:** For example, "relapsed after second HSCT"
-   *  Focus on information that is directly relevant to potential therapy selection or clinical management. Avoid vague or redundant information like "very good clinical condition". 
-   
-**Example:**
-
-*  **Case Note Input:** "A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO DBH AML 2012 protocol. Post- MEC and ADE, MRD remained at 35% and 53%. Vyxeos-clofarabine therapy reduced MRD to 18%. Third-line FLAG-Mylotarg lowered MRD to 3.5% (flow) and 1% (molecular). After a cord blood HSCT in December 2022, she relapsed 10 months later with 3% MRD and femoral extramedullary disease.
-After the iLTB discussion, in November 2023 the patient was enrolled in the SNDX5613 trial, receiving revumenib for three months, leading to a reduction in KMT2A MRD to 0.1% by PCR. Subsequently, the patient underwent a second allogeneic HSCT using cord blood with treosulfan, thiotepa, and fludarabine conditioning, followed by revumenib maintenance. In August 2024, 6.5 months after the second HSCT, the patient experienced a bone marrow relapse with 33% blasts. The patient is currently in very good clinical condition.             
-Diagnostic tests:                                                     
-WES and RNAseq were performed on the 1st relapse sample showing KMT2A::MLLT3 fusion and NRAS (p.Gln61Lys) mutation.
-Flow cytometry from the current relapse showed positive CD33 and CD123.
-WES and RNAseq of the current relapse sample is pending. "
-
-**Output:**  
-"KMT2A::MLLT3 fusion" "NRAS" "CD33" "CD123"
-
-**Reasoning and Guidance:**
-
-*  **Focus on Actionable Events:** We are not trying to summarize the case but to find what information is relevant to decision-making. This helps filter noise and focus on clinically significant findings.
-*  **Prioritization:** Starting with pediatric studies ensures that we tailor our searches to the specific patient population.
-*  **Specific Search Terms:** Using exact terms such as "KMT2A::MLLT3 fusion" is essential for precision. Adding "therapy", "treatment" or "clinical trials" helps to find relevant studies.
-*  **Combinations:** Combining genetic and immunophenotypic features allows for refined searches that might be more relevant to the patient.
-*  **Iteration:** If initial search results are not helpful, we can modify and refine the queries based on the available data.
-
-Extract actionable events from the provided patient information, such as gene fusions, mutations, and positive markers.  Only output the list of actionable events. Do not include any other text or formatting."""
+Output only the list of actionable events. No additional text or formatting.
+"""
 
 # --- Helper Functions for Enhanced Setup ---
 def get_user_credentials_from_gcloud():
@@ -382,13 +348,11 @@ def extract_medical_info(case_text, client, disease_prompt=None, events_prompt=N
     if not events_prompt:
         events_prompt = EVENT_EXTRACTION_PROMPT
     
-    # Extract disease
-    full_disease_prompt = f"{disease_prompt}\n\n{case_text}"
+    full_disease_prompt = f"{disease_prompt}\n\nCase notes:\n{case_text}"
     response = client.models.generate_content(model=MODEL_ID, contents=[full_disease_prompt], config=GenerateContentConfig(temperature=0))
     results["disease"] = response.text.strip()
     
-    # Extract events
-    full_events_prompt = f"{events_prompt}\n\n{case_text}"
+    full_events_prompt = f"{events_prompt}\n\nCase notes:\n{case_text}"
     response = client.models.generate_content(model=MODEL_ID, contents=[full_events_prompt], config=GenerateContentConfig(temperature=0))
     results["events"] = response.text.strip()
     
@@ -772,14 +736,14 @@ def create_app(share=False):
                     disease_prompt_input = gr.Textbox(
                         label="Disease Extraction Prompt",
                         value="",
-                        lines=8,
+                        lines=5,
                         placeholder="Enter prompt for disease extraction..."
                     )
                     
                     events_prompt_input = gr.Textbox(
                         label="Events Extraction Prompt", 
                         value="",
-                        lines=8,
+                        lines=5,
                         placeholder="Enter prompt for actionable events extraction..."
                     )
                     

@@ -351,6 +351,129 @@ def calculate_article_score(metadata, config):
     if metadata.get('clinical_trial'): score += config.get('clinical_trial', 40)
     return round(score, 2)
 
+def normalize_journal_score(sjr):
+    """Normalize journal SJR score using logarithmic scale (from gemini-medical-literature)."""
+    if not sjr or sjr <= 0:
+        return 0
+    # Use log scale to handle large range of SJR values
+    normalized = math.log(sjr + 1) * 5
+    # Cap at 25 points
+    return min(normalized, 25)
+
+def calculate_dynamic_score(metadata, criteria_list, journal_dict):
+    """Calculate article score based on dynamic criteria configuration."""
+    score = 0
+    current_year = datetime.now().year
+    
+    for criterion in criteria_list:
+        # Skip if weight is 0
+        if criterion['weight'] == 0:
+            continue
+            
+        criterion_type = criterion.get('type', 'boolean')
+        criterion_name = criterion['name']
+        
+        if criterion_type == 'special_journal':
+            # Special handling for journal impact using SJR scores
+            journal_title = metadata.get('journal_title', '')
+            sjr = journal_dict.get(journal_title, 0)
+            if sjr > 0:
+                impact_score = normalize_journal_score(sjr)
+                # Scale by user's weight (weight represents importance multiplier)
+                score += impact_score * (criterion['weight'] / 25)  # Normalize to 25 max
+                
+        elif criterion_type == 'special_year':
+            # Year penalty: -5 points per year from current
+            if metadata.get('year'):
+                try:
+                    article_year = int(metadata.get('year'))
+                    year_diff = current_year - article_year
+                    year_penalty = -5 * year_diff
+                    # Apply user's weight as a multiplier
+                    score += year_penalty * criterion['weight']
+                except (ValueError, TypeError):
+                    pass
+                    
+        elif criterion_type == 'numeric':
+            # For numeric criteria, multiply value by weight
+            value = metadata.get(criterion_name, 0)
+            if isinstance(value, (int, float)):
+                score += value * criterion['weight']
+                
+        elif criterion_type == 'direct':
+            # For direct scoring, use the value as-is (ignore weight)
+            value = metadata.get(criterion_name, 0)
+            if isinstance(value, (int, float)):
+                score += value
+                
+        else:
+            # Default: boolean criteria
+            if metadata.get(criterion_name):
+                score += criterion['weight']
+                
+    return round(score, 2)
+
+def analyze_article_batch_with_criteria(df, disease, events, client, journal_dict, persona, criteria):
+    """Analyze articles with custom persona and dynamic criteria."""
+    # Build journal context
+    journal_context = "\n".join([f"- {title}: {sjr}" for title, sjr in list(journal_dict.items())[:100]])  # Limit to first 100 for prompt size
+    
+    # Build criteria evaluation instructions dynamically from all criteria (except special ones)
+    criteria_instructions = []
+    for criterion in criteria:
+        # Skip special criteria that are handled differently
+        if criterion['name'] not in ['journal_impact', 'year']:
+            if criterion['type'] == 'boolean':
+                criteria_instructions.append(f"- {criterion['name']} (boolean): {criterion['description']}")
+            elif criterion['type'] == 'numeric':
+                criteria_instructions.append(f"- {criterion['name']} (number): {criterion['description']}")
+            elif criterion['type'] == 'direct':
+                criteria_instructions.append(f"- {criterion['name']} (number 0-100): {criterion['description']}")
+    
+    # Build the prompt with only standard fields hardcoded
+    criteria_text = "\n".join(criteria_instructions) if criteria_instructions else ""
+    
+    prompt = f"""{persona}
+
+Analyze the following articles for relevance to:
+- Disease: {disease}
+- Events: {', '.join(events)}
+
+Journal Impact Data (sample):
+{journal_context}
+
+For each article, extract the following information:
+1. Standard fields (always extract these):
+   - title: Article title
+   - journal_title: Name of the journal
+   - journal_sjr: SJR score from the provided list (or 0 if not found)
+   - year: Publication year
+
+2. Evaluation criteria:
+{criteria_text}
+
+Return your analysis as a JSON array with one object per article.
+"""
+    
+    # Compile articles text
+    articles_text = ""
+    for _, row in df.iterrows():
+        content = row.get('content', row.get('abstract', ''))
+        articles_text += f"\n---\nPMID: {row['PMID']}\nContent: {content}\n"
+    
+    # Generate analysis
+    response = client.models.generate_content(
+        model=MODEL_ID, 
+        contents=[prompt + articles_text], 
+        config=GenerateContentConfig(temperature=0, response_mime_type="application/json")
+    )
+    
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        print(f"Failed to parse JSON response: {response.text}")
+        return []
+
 def setup_bigquery(project, dataset, client, progress=gr.Progress()):
     """Setup BigQuery dataset and model with retry logic."""
     progress(0.8, desc="Setting up BigQuery dataset and model (may take a couple minutes if first time)...")
@@ -466,7 +589,7 @@ def run_analysis(case_text, num_articles, progress=gr.Progress()):
     progress(0.9, desc="Generating results...")
     results_table = articles_df[['score', 'title', 'journal_title', 'year']].head(10)
     results = {'articles': articles_df.to_dict('records'), 'disease': disease, 'events': events, 'case_text': case_text}
-    return results_table, f"✅ Analysis complete for '{disease}'.", results, gr.update(selected=3)
+    return results_table, f"✅ Analysis complete for '{disease}'.", results, gr.update(selected=4)
 
 def create_app(share=False):
     """Create and return the Gradio app."""
@@ -536,12 +659,86 @@ def create_app(share=False):
                     proceed_btn = gr.Button("Proceed", variant="primary")
 
             with gr.TabItem("2. Case", id=2):
-                case_input = gr.Textbox(label="Patient Case Notes", value=SAMPLE_CASE, lines=10)
-                num_articles_slider = gr.Slider(5, 50, 10, step=1, label="Number of Articles to Analyze")
+                # Add header row with example button
+                with gr.Row():
+                    gr.Markdown("## Patient Case Notes")
+                    load_example_btn = gr.Button("Load Example", size="sm", scale=0)
+                
+                # Empty case input by default
+                case_input = gr.Textbox(
+                    label="", 
+                    value="",  # Empty instead of SAMPLE_CASE
+                    lines=10,
+                    placeholder="Enter patient case details here..."
+                )
+                
+                # Hidden slider - keeps default value of 10
+                num_articles_slider = gr.Slider(
+                    5, 50, 10, 
+                    step=1, 
+                    label="Number of Articles to Analyze",
+                    visible=False  # Hide the slider
+                )
+                
+                # Changed button text and purpose
+                proceed_to_persona_btn = gr.Button("Proceed", variant="primary", interactive=False)
+                case_status = gr.Markdown()
+
+            with gr.TabItem("3. Persona", id=3):
+                gr.Markdown("## Customize Your Analysis Persona")
+                gr.Markdown("*Define your research perspective and customize how articles will be scored for relevance.*")
+                
+                # Persona Section (Top Box)
+                with gr.Column():
+                    gr.Markdown("### Analysis Persona")
+                    with gr.Row():
+                        with gr.Column(scale=4):
+                            persona_text = gr.Textbox(
+                                label="",
+                                value="You are a medical researcher analyzing literature for clinical relevance and treatment insights.",
+                                lines=4,
+                                placeholder="Describe your research perspective and goals..."
+                            )
+                        with gr.Column(scale=1):
+                            load_persona_btn = gr.Button("Load Example", size="sm")
+                            
+                    # Example personas (hidden, for dropdown)
+                    example_personas = gr.State({
+                        "Clinical Researcher": "You are a pediatric oncologist focused on finding the latest treatment protocols and clinical trial results for childhood cancers. Prioritize evidence-based therapies with proven efficacy.",
+                        "Pharmaceutical Developer": "You are a pharmaceutical researcher looking for novel drug targets and biomarkers with strong preclinical and clinical evidence. Focus on mechanistic insights and translational potential.",
+                        "Patient Advocate": "You are evaluating treatment options from a patient perspective, prioritizing safety profiles, quality of life outcomes, and accessibility of treatments.",
+                        "Basic Scientist": "You are a molecular biologist interested in understanding disease mechanisms at the cellular and molecular level. Focus on novel pathways, genetic factors, and potential therapeutic targets."
+                    })
+                
+                gr.Markdown("---")
+                
+                # Scoring Criteria Section (Bottom Box)
+                with gr.Column():
+                    gr.Markdown("### Article Scoring Criteria")
+                    gr.Markdown("*Adjust weights to prioritize what matters most for your analysis. Articles will be scored based on these criteria.*")
+                    
+                    # We'll store criteria in state
+                    criteria_state = gr.State([])
+                    
+                    # Dynamic criteria display
+                    criteria_display = gr.HTML(value="<div>Loading criteria...</div>")
+                    
+                    # Add controls
+                    with gr.Row():
+                        add_criterion_btn = gr.Button("➕ Add New Criterion", size="sm")
+                        reset_criteria_btn = gr.Button("🔄 Reset to Defaults", size="sm")
+                        
+                    # Total weight display
+                    total_weight_display = gr.Markdown("**Total Weight:** 0")
+                    
+                    # Hidden components for interaction
+                    criterion_action = gr.Textbox(visible=False)
+                    criterion_data = gr.JSON(visible=False)
+                    
                 analyze_btn = gr.Button("Run Full Analysis", variant="primary", interactive=False)
                 analysis_status = gr.Markdown()
 
-            with gr.TabItem("3. Results", id=3):
+            with gr.TabItem("4. Results", id=4):
                 results_df = gr.DataFrame(label="Top 10 Ranked Articles")
 
         # --- Event Handlers for UI ---
@@ -722,10 +919,238 @@ def create_app(share=False):
             outputs=[tabs]
         )
 
-        # Analysis Tab Interactions
+        # Case Tab Interactions
+        # Enable/disable proceed button based on case input
+        def check_case_input(case_text):
+            if case_text.strip():
+                return gr.update(interactive=True)
+            else:
+                return gr.update(interactive=False)
+        
+        case_input.change(
+            check_case_input,
+            inputs=[case_input],
+            outputs=[proceed_to_persona_btn]
+        )
+        
+        # Load example button handler
+        def load_example_case():
+            return SAMPLE_CASE, gr.update(interactive=True)
+
+        load_example_btn.click(
+            load_example_case,
+            outputs=[case_input, proceed_to_persona_btn]
+        )
+
+        # Modified proceed button handler to go to Persona tab
+        def proceed_to_persona(case_text):
+            if not case_text.strip():
+                return "❌ Please enter case notes first.", gr.update(interactive=False), gr.update()
+            return "✅ Case notes saved. Please customize your persona.", gr.update(interactive=True), gr.update(selected=3)
+
+        proceed_to_persona_btn.click(
+            proceed_to_persona,
+            inputs=[case_input],
+            outputs=[case_status, analyze_btn, tabs]
+        )
+
+        # Persona Tab Interactions
+        def load_example_persona(personas):
+            """Load a random example persona."""
+            import random
+            persona_name = random.choice(list(personas.keys()))
+            return personas[persona_name]
+        
+        load_persona_btn.click(
+            load_example_persona,
+            inputs=[example_personas],
+            outputs=[persona_text]
+        )
+        
+        # Default criteria configuration
+        DEFAULT_CRITERIA = [
+            {"name": "disease_match", "description": "Does the article match the patient's disease?", "weight": 50, "type": "boolean", "deletable": True},
+            {"name": "treatment_shown", "description": "Does the article show positive treatment results?", "weight": 50, "type": "boolean", "deletable": True},
+            {"name": "pediatric_focus", "description": "Does the article focus on pediatric patients?", "weight": 20, "type": "boolean", "deletable": True},
+            {"name": "clinical_trial", "description": "Is this a clinical trial?", "weight": 40, "type": "boolean", "deletable": True},
+            {"name": "novelty", "description": "Does the article present novel findings?", "weight": 10, "type": "boolean", "deletable": True},
+            {"name": "actionable_events_match", "description": "How many actionable events from the patient's case are mentioned in this article?", "weight": 15, "type": "direct", "deletable": True},
+            {"name": "human_clinical_data", "description": "Does the article include human clinical data?", "weight": 15, "type": "boolean", "deletable": True},
+            {"name": "cell_studies", "description": "Does the article include cell studies?", "weight": 5, "type": "boolean", "deletable": True},
+            {"name": "mice_studies", "description": "Does the article include mice studies?", "weight": 10, "type": "boolean", "deletable": True},
+            {"name": "journal_impact", "description": "Journal impact factor (SJR)", "weight": 25, "type": "special_journal", "deletable": True},
+            {"name": "year", "description": "Publication year penalty", "weight": 1, "type": "special_year", "deletable": True}
+        ]
+        
+        def render_criteria_html(criteria_list):
+            """Render criteria as HTML for display."""
+            html = '<div style="display: flex; flex-direction: column; gap: 12px;">'
+            
+            for idx, criterion in enumerate(criteria_list):
+                deletable = criterion.get('deletable', True)
+                user_defined = criterion.get('user_defined', False)
+                
+                # Different colors for different types
+                type_colors = {
+                    'boolean': '#4CAF50',
+                    'numeric': '#2196F3', 
+                    'direct': '#FF9800',
+                    'special_journal': '#9C27B0',
+                    'special_year': '#F44336'
+                }
+                type_color = type_colors.get(criterion['type'], '#607D8B')
+                
+                html += f'''
+                <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; background: #fafafa;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <div style="flex: 1;">
+                            <strong style="font-size: 16px;">{criterion['description']}</strong>
+                            <div style="margin-top: 5px;">
+                                <span style="background: {type_color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-right: 8px;">
+                                    {criterion['type']}
+                                </span>
+                                <span style="color: #666; font-size: 12px;">Name: {criterion['name']}</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 16px;">
+                        <div style="flex: 1;">
+                            <label style="font-size: 14px; color: #666;">Weight: <strong>{criterion['weight']}</strong></label>
+                            <input type="range" min="0" max="100" value="{criterion['weight']}" 
+                                   style="width: 100%; margin-top: 5px;"
+                                   onchange="window.updateCriterionWeight({idx}, this.value)">
+                        </div>
+                        <button style="background: {'#ccc' if not deletable else '#f44336'}; color: white; border: none; 
+                                       padding: 6px 12px; border-radius: 4px; cursor: {'not-allowed' if not deletable else 'pointer'}; 
+                                       font-size: 14px;"
+                                onclick="window.deleteCriterion({idx})"
+                                {'disabled' if not deletable else ''}>
+                            🗑️ Delete
+                        </button>
+                    </div>
+                </div>
+                '''
+            
+            html += '</div>'
+            
+            # Add JavaScript for interaction
+            html += '''
+            <script>
+                window.updateCriterionWeight = function(idx, value) {
+                    // This will be handled by Gradio event
+                    console.log('Update weight:', idx, value);
+                };
+                window.deleteCriterion = function(idx) {
+                    // This will be handled by Gradio event
+                    console.log('Delete criterion:', idx);
+                };
+            </script>
+            '''
+            
+            return html
+        
+        def calculate_total_weight(criteria_list):
+            """Calculate total weight from criteria list."""
+            total = sum(c['weight'] for c in criteria_list)
+            return f"**Total Weight:** {total}"
+        
+        def update_criterion_weight(criteria_list, idx, new_weight):
+            """Update weight for a specific criterion."""
+            if 0 <= idx < len(criteria_list):
+                criteria_list[idx]['weight'] = new_weight
+            return criteria_list, calculate_total_weight(criteria_list)
+        
+        def delete_criterion(criteria_list, idx):
+            """Delete a criterion from the list."""
+            if 0 <= idx < len(criteria_list) and criteria_list[idx].get('deletable', True):
+                criteria_list.pop(idx)
+            return criteria_list, calculate_total_weight(criteria_list)
+        
+        def add_new_criterion(criteria_list):
+            """Add a new custom criterion."""
+            new_criterion = {
+                "name": f"custom_{len(criteria_list)}",
+                "description": "New custom criterion",
+                "weight": 10,
+                "type": "boolean",
+                "deletable": True,
+                "user_defined": True
+            }
+            criteria_list.append(new_criterion)
+            return criteria_list, render_criteria_html(criteria_list), calculate_total_weight(criteria_list)
+        
+        def reset_to_defaults():
+            """Reset criteria to defaults."""
+            return DEFAULT_CRITERIA.copy(), render_criteria_html(DEFAULT_CRITERIA), calculate_total_weight(DEFAULT_CRITERIA)
+        
+        # Initialize criteria state on load
+        def initialize_criteria():
+            criteria = DEFAULT_CRITERIA.copy()
+            return criteria, render_criteria_html(criteria), calculate_total_weight(criteria)
+        
+        # Set up initial criteria
+        demo.load(
+            initialize_criteria,
+            outputs=[criteria_state, criteria_display, total_weight_display]
+        )
+        
+        # Criteria management event handlers
+        add_criterion_btn.click(
+            add_new_criterion,
+            inputs=[criteria_state],
+            outputs=[criteria_state, criteria_display, total_weight_display]
+        )
+        
+        reset_criteria_btn.click(
+            reset_to_defaults,
+            outputs=[criteria_state, criteria_display, total_weight_display]
+        )
+        
+        # Modified analyze button to use persona and criteria
+        def run_analysis_with_persona(case_text, num_articles, persona, criteria, progress=gr.Progress()):
+            """Run analysis with custom persona and scoring criteria."""
+            if not genai_client or not bq_client:
+                return None, "❌ Please complete setup first.", {}, gr.update()
+            
+            progress(0.1, desc="Extracting medical info...")
+            medical_info = extract_medical_info(case_text, genai_client)
+            disease = medical_info.get('disease', '')
+            events = [e.strip() for e in medical_info.get('events', '').split(',')]
+
+            progress(0.3, desc="Searching PubMed...")
+            embedding_model_path = f"{PROJECT_ID}.{USER_DATASET}.textembed"
+            articles_df = search_pubmed_articles(disease, events, bq_client, embedding_model_path, PUBMED_TABLE, num_articles)
+
+            progress(0.6, desc="Analyzing articles with custom criteria...")
+            # Modified to pass persona and criteria
+            analyses = analyze_article_batch_with_criteria(articles_df, disease, events, genai_client, journal_impact_dict, persona, criteria)
+
+            for i, analysis in enumerate(analyses):
+                for k, v in analysis.items():
+                    articles_df.loc[i, k] = v
+
+            # Use dynamic scoring
+            articles_df['score'] = articles_df.apply(
+                lambda row: calculate_dynamic_score(row, criteria, journal_impact_dict), 
+                axis=1
+            )
+            articles_df = articles_df.sort_values('score', ascending=False).reset_index()
+
+            progress(0.9, desc="Generating results...")
+            results_table = articles_df[['score', 'title', 'journal_title', 'year']].head(10)
+            results = {
+                'articles': articles_df.to_dict('records'), 
+                'disease': disease, 
+                'events': events, 
+                'case_text': case_text,
+                'persona': persona,
+                'criteria': criteria
+            }
+            return results_table, f"✅ Analysis complete for '{disease}'.", results, gr.update(selected=4)
+        
         analyze_btn.click(
-            run_analysis, 
-            inputs=[case_input, num_articles_slider], 
+            run_analysis_with_persona,
+            inputs=[case_input, num_articles_slider, persona_text, criteria_state],
             outputs=[results_df, analysis_status, app_state, tabs]
         )
 

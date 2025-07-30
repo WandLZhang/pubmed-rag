@@ -372,18 +372,24 @@ def load_journal_data():
     except:
         return {}
 
-def extract_medical_info(case_text, client):
-    """Extract medical information using sophisticated prompts from gemini-medical-literature."""
+def extract_medical_info(case_text, client, disease_prompt=None, events_prompt=None):
+    """Extract medical information using custom or default prompts."""
     results = {}
     
-    # Extract disease using the sophisticated prompt
-    disease_prompt = f"{DISEASE_EXTRACTION_PROMPT}\n\n{case_text}"
-    response = client.models.generate_content(model=MODEL_ID, contents=[disease_prompt], config=GenerateContentConfig(temperature=0))
+    # Use provided prompts or defaults
+    if not disease_prompt:
+        disease_prompt = DISEASE_EXTRACTION_PROMPT
+    if not events_prompt:
+        events_prompt = EVENT_EXTRACTION_PROMPT
+    
+    # Extract disease
+    full_disease_prompt = f"{disease_prompt}\n\n{case_text}"
+    response = client.models.generate_content(model=MODEL_ID, contents=[full_disease_prompt], config=GenerateContentConfig(temperature=0))
     results["disease"] = response.text.strip()
     
-    # Extract events using the sophisticated prompt
-    events_prompt = f"{EVENT_EXTRACTION_PROMPT}\n\n{case_text}"
-    response = client.models.generate_content(model=MODEL_ID, contents=[events_prompt], config=GenerateContentConfig(temperature=0))
+    # Extract events
+    full_events_prompt = f"{events_prompt}\n\n{case_text}"
+    response = client.models.generate_content(model=MODEL_ID, contents=[full_events_prompt], config=GenerateContentConfig(temperature=0))
     results["events"] = response.text.strip()
     
     return results
@@ -759,11 +765,26 @@ def create_app(share=False):
                 gr.Markdown("---")
                 
                 with gr.Column():
-                    # Extract button
-                    extract_btn = gr.Button("Extract Information", variant="secondary")
-                    
                     # Info text inline
-                    gr.Markdown("#### Extract Information <span style='color: #666; font-size: 0.85em; font-weight: normal; margin-left: 10px;'>This will help the BigQuery vector search be more refined</span>", visible=False, elem_id="extract_info_header")
+                    gr.Markdown("#### Extract Information <span style='color: #666; font-size: 0.85em; font-weight: normal; margin-left: 10px;'>This will help the BigQuery vector search be more refined</span>")
+                    
+                    # Prompt input fields
+                    disease_prompt_input = gr.Textbox(
+                        label="Disease Extraction Prompt",
+                        value="",
+                        lines=8,
+                        placeholder="Enter prompt for disease extraction..."
+                    )
+                    
+                    events_prompt_input = gr.Textbox(
+                        label="Events Extraction Prompt", 
+                        value="",
+                        lines=8,
+                        placeholder="Enter prompt for actionable events extraction..."
+                    )
+                    
+                    # Extract button
+                    extract_btn = gr.Button("Extract", variant="secondary")
                     
                     # Extraction results box
                     with gr.Column(visible=False) as extraction_box:
@@ -1070,11 +1091,10 @@ def create_app(share=False):
         )
 
         # Case Tab Interactions
-        def extract_and_display(case_text):
-            """Extract medical information and display results."""
+        def extract_and_display(case_text, disease_prompt, events_prompt):
+            """Extract medical information and display results using custom prompts."""
             if not case_text.strip():
                 return (
-                    gr.update(visible=True),  # extract_info_header
                     gr.update(visible=False),  # extraction_box
                     "",  # extraction_display
                     {"extracted": False, "disease": "", "events": ""},  # extraction_state
@@ -1085,7 +1105,6 @@ def create_app(share=False):
             if not genai_client:
                 return (
                     gr.update(visible=True),
-                    gr.update(visible=True),
                     "❌ Please complete setup first.",
                     {"extracted": False, "disease": "", "events": ""},
                     gr.update(interactive=False),
@@ -1093,8 +1112,8 @@ def create_app(share=False):
                 )
             
             try:
-                # Extract medical info
-                medical_info = extract_medical_info(case_text, genai_client)
+                # Extract medical info with custom prompts
+                medical_info = extract_medical_info(case_text, genai_client, disease_prompt, events_prompt)
                 disease = medical_info.get('disease', '')
                 events = medical_info.get('events', '')
                 
@@ -1107,7 +1126,6 @@ def create_app(share=False):
 </div>"""
                 
                 return (
-                    gr.update(visible=True),  # extract_info_header
                     gr.update(visible=True),  # extraction_box
                     display_text,  # extraction_display
                     {"extracted": True, "disease": disease, "events": events},  # extraction_state
@@ -1118,7 +1136,6 @@ def create_app(share=False):
             except Exception as e:
                 return (
                     gr.update(visible=True),
-                    gr.update(visible=True),
                     f"❌ Error extracting information: {str(e)}",
                     {"extracted": False, "disease": "", "events": ""},
                     gr.update(interactive=False),
@@ -1128,8 +1145,8 @@ def create_app(share=False):
         # Extract button click handler
         extract_btn.click(
             extract_and_display,
-            inputs=[case_input],
-            outputs=[gr.Markdown(elem_id="extract_info_header"), extraction_box, extraction_display, extraction_state, proceed_to_persona_btn, case_status]
+            inputs=[case_input, disease_prompt_input, events_prompt_input],
+            outputs=[extraction_box, extraction_display, extraction_state, proceed_to_persona_btn, case_status]
         )
         
         # Enable/disable extract button based on case input
@@ -1147,11 +1164,16 @@ def create_app(share=False):
         
         # Load example button handler
         def load_example_case():
-            return SAMPLE_CASE
+            """Load example case notes and prompts."""
+            return (
+                SAMPLE_CASE,
+                DISEASE_EXTRACTION_PROMPT,
+                EVENT_EXTRACTION_PROMPT
+            )
 
         load_example_btn.click(
             load_example_case,
-            outputs=[case_input]
+            outputs=[case_input, disease_prompt_input, events_prompt_input]
         )
 
         # Modified proceed button handler to go to Persona tab

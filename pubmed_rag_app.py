@@ -604,6 +604,10 @@ def create_app(share=False):
     .label-wrap {
         border: none !important;
     }
+    .type-info {
+        font-size: 0.9em;
+        color: #666;
+    }
     """
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="sky"), css=css) as demo:
         gr.Markdown("# 🏥 PubMed Literature Analysis")
@@ -720,9 +724,6 @@ def create_app(share=False):
                     # We'll store criteria in state
                     criteria_state = gr.State([])
                     
-                    # Dynamic criteria display
-                    criteria_display = gr.HTML(value="<div>Loading criteria...</div>")
-                    
                     # Add controls
                     with gr.Row():
                         add_criterion_btn = gr.Button("➕ Add New Criterion", size="sm")
@@ -731,9 +732,62 @@ def create_app(share=False):
                     # Total weight display
                     total_weight_display = gr.Markdown("**Total Weight:** 0")
                     
-                    # Hidden components for interaction
-                    criterion_action = gr.Textbox(visible=False)
-                    criterion_data = gr.JSON(visible=False)
+                    # Container for criteria - pre-create 20 slots
+                    criterion_rows = []
+                    criterion_descriptions = []
+                    criterion_type_infos = []
+                    criterion_sliders = []
+                    criterion_delete_btns = []
+                    
+                    with gr.Column() as criteria_container:
+                        for i in range(20):  # Create 20 slots
+                            with gr.Row(visible=False) as row:
+                                with gr.Column(scale=3):
+                                    desc = gr.Markdown("")
+                                    type_info = gr.Markdown("", elem_classes="type-info")
+                                
+                                with gr.Column(scale=2):
+                                    slider = gr.Slider(
+                                        minimum=0,
+                                        maximum=100,
+                                        value=0,
+                                        label="Weight",
+                                        step=1
+                                    )
+                                
+                                with gr.Column(scale=1):
+                                    delete_btn = gr.Button("🗑️ Delete", variant="stop", size="sm")
+                            
+                            criterion_rows.append(row)
+                            criterion_descriptions.append(desc)
+                            criterion_type_infos.append(type_info)
+                            criterion_sliders.append(slider)
+                            criterion_delete_btns.append(delete_btn)
+                    
+                    # Add criterion dialog
+                    with gr.Column(visible=False) as add_criterion_dialog:
+                        gr.Markdown("### Add New Scoring Criterion")
+                        new_criterion_description = gr.Textbox(
+                            label="Description",
+                            placeholder="e.g., Does the article include safety data?",
+                            lines=2
+                        )
+                        new_criterion_type = gr.Dropdown(
+                            label="Type",
+                            choices=["boolean", "numeric", "direct"],
+                            value="boolean",
+                            info="Boolean: Yes/No criteria | Numeric: Multiplies value by weight | Direct: Uses value as-is"
+                        )
+                        new_criterion_weight = gr.Slider(
+                            label="Weight",
+                            minimum=0,
+                            maximum=100,
+                            value=10,
+                            step=1
+                        )
+                        with gr.Row():
+                            confirm_add_btn = gr.Button("Add", variant="primary", size="sm")
+                            cancel_add_btn = gr.Button("Cancel", size="sm")
                     
                 analyze_btn = gr.Button("Run Full Analysis", variant="primary", interactive=False)
                 analysis_status = gr.Markdown()
@@ -982,129 +1036,178 @@ def create_app(share=False):
             {"name": "year", "description": "Publication year penalty", "weight": 1, "type": "special_year", "deletable": True}
         ]
         
-        def render_criteria_html(criteria_list):
-            """Render criteria as HTML for display."""
-            html = '<div style="display: flex; flex-direction: column; gap: 12px;">'
-            
-            for idx, criterion in enumerate(criteria_list):
-                deletable = criterion.get('deletable', True)
-                user_defined = criterion.get('user_defined', False)
-                
-                # Different colors for different types
-                type_colors = {
-                    'boolean': '#4CAF50',
-                    'numeric': '#2196F3', 
-                    'direct': '#FF9800',
-                    'special_journal': '#9C27B0',
-                    'special_year': '#F44336'
-                }
-                type_color = type_colors.get(criterion['type'], '#607D8B')
-                
-                html += f'''
-                <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; background: #fafafa;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                        <div style="flex: 1;">
-                            <strong style="font-size: 16px;">{criterion['description']}</strong>
-                            <div style="margin-top: 5px;">
-                                <span style="background: {type_color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-right: 8px;">
-                                    {criterion['type']}
-                                </span>
-                                <span style="color: #666; font-size: 12px;">Name: {criterion['name']}</span>
-                            </div>
-                        </div>
-                    </div>
-                    <div style="display: flex; align-items: center; gap: 16px;">
-                        <div style="flex: 1;">
-                            <label style="font-size: 14px; color: #666;">Weight: <strong>{criterion['weight']}</strong></label>
-                            <input type="range" min="0" max="100" value="{criterion['weight']}" 
-                                   style="width: 100%; margin-top: 5px;"
-                                   onchange="window.updateCriterionWeight({idx}, this.value)">
-                        </div>
-                        <button style="background: {'#ccc' if not deletable else '#f44336'}; color: white; border: none; 
-                                       padding: 6px 12px; border-radius: 4px; cursor: {'not-allowed' if not deletable else 'pointer'}; 
-                                       font-size: 14px;"
-                                onclick="window.deleteCriterion({idx})"
-                                {'disabled' if not deletable else ''}>
-                            🗑️ Delete
-                        </button>
-                    </div>
-                </div>
-                '''
-            
-            html += '</div>'
-            
-            # Add JavaScript for interaction
-            html += '''
-            <script>
-                window.updateCriterionWeight = function(idx, value) {
-                    // This will be handled by Gradio event
-                    console.log('Update weight:', idx, value);
-                };
-                window.deleteCriterion = function(idx) {
-                    // This will be handled by Gradio event
-                    console.log('Delete criterion:', idx);
-                };
-            </script>
-            '''
-            
-            return html
-        
         def calculate_total_weight(criteria_list):
             """Calculate total weight from criteria list."""
-            total = sum(c['weight'] for c in criteria_list)
+            total = sum(c['weight'] for c in criteria_list if c is not None)
             return f"**Total Weight:** {total}"
         
-        def update_criterion_weight(criteria_list, idx, new_weight):
-            """Update weight for a specific criterion."""
-            if 0 <= idx < len(criteria_list):
-                criteria_list[idx]['weight'] = new_weight
-            return criteria_list, calculate_total_weight(criteria_list)
+        def update_criteria_display(criteria_list):
+            """Update all criterion slot displays based on the criteria list."""
+            updates = []
+            
+            # Type badge styling
+            type_colors = {
+                'boolean': '🟢',
+                'numeric': '🔵', 
+                'direct': '🟠',
+                'special_journal': '🟣',
+                'special_year': '🔴'
+            }
+            
+            for i in range(20):
+                if i < len(criteria_list) and criteria_list[i] is not None:
+                    criterion = criteria_list[i]
+                    # Row visibility
+                    updates.append(gr.update(visible=True))
+                    # Description
+                    updates.append(gr.update(value=f"**{criterion['description']}**"))
+                    # Type info
+                    type_emoji = type_colors.get(criterion['type'], '⚫')
+                    updates.append(gr.update(value=f"{type_emoji} Type: `{criterion['type']}` | Name: `{criterion['name']}`"))
+                    # Slider value
+                    updates.append(gr.update(value=criterion['weight']))
+                    # Delete button
+                    if criterion.get('deletable', True):
+                        updates.append(gr.update(visible=True, interactive=True))
+                    else:
+                        updates.append(gr.update(visible=False))
+                else:
+                    # Hide this slot
+                    updates.append(gr.update(visible=False))
+                    updates.append(gr.update(value=""))
+                    updates.append(gr.update(value=""))
+                    updates.append(gr.update(value=0))
+                    updates.append(gr.update(visible=False))
+            
+            # Add total weight
+            updates.append(calculate_total_weight(criteria_list))
+            
+            return updates
         
-        def delete_criterion(criteria_list, idx):
-            """Delete a criterion from the list."""
-            if 0 <= idx < len(criteria_list) and criteria_list[idx].get('deletable', True):
-                criteria_list.pop(idx)
-            return criteria_list, calculate_total_weight(criteria_list)
+        def show_add_criterion_dialog(criteria_list):
+            """Show the dialog for adding a new criterion if there's space."""
+            if len([c for c in criteria_list if c is not None]) >= 20:
+                return gr.update(visible=False), gr.update(visible=True, value="⚠️ Maximum 20 criteria reached")
+            return gr.update(visible=True), gr.update(visible=False)
         
-        def add_new_criterion(criteria_list):
-            """Add a new custom criterion."""
+        def hide_add_criterion_dialog():
+            """Hide the add criterion dialog."""
+            return gr.update(visible=False), "", "boolean", 10
+        
+        def add_new_criterion_with_details(criteria_list, description, criterion_type, weight):
+            """Add a new custom criterion with user-provided details."""
+            if not description.strip():
+                return [criteria_list] + update_criteria_display(criteria_list) + [gr.update(visible=True)]
+            
+            # Check if we have space
+            if len([c for c in criteria_list if c is not None]) >= 20:
+                return [criteria_list] + update_criteria_display(criteria_list) + [gr.update(visible=True)]
+            
+            # Generate a safe name from description
+            import re
+            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', description.lower())[:30]
+            if not safe_name or safe_name[0].isdigit():
+                safe_name = f"custom_{len([c for c in criteria_list if c is not None])}"
+            
             new_criterion = {
-                "name": f"custom_{len(criteria_list)}",
-                "description": "New custom criterion",
-                "weight": 10,
-                "type": "boolean",
+                "name": safe_name,
+                "description": description.strip(),
+                "weight": weight,
+                "type": criterion_type,
                 "deletable": True,
                 "user_defined": True
             }
-            criteria_list.append(new_criterion)
-            return criteria_list, render_criteria_html(criteria_list), calculate_total_weight(criteria_list)
+            
+            # Add to the list
+            new_list = criteria_list.copy()
+            new_list.append(new_criterion)
+            
+            return [new_list] + update_criteria_display(new_list) + [gr.update(visible=False)]
+        
+        def update_criterion_weight(criteria_list, slot_index, new_weight):
+            """Update the weight for a specific criterion."""
+            if slot_index < len(criteria_list) and criteria_list[slot_index] is not None:
+                new_list = criteria_list.copy()
+                new_list[slot_index]['weight'] = new_weight
+                return new_list, calculate_total_weight(new_list)
+            return criteria_list, calculate_total_weight(criteria_list)
+        
+        def delete_criterion(criteria_list, slot_index):
+            """Delete a criterion from a specific slot."""
+            if slot_index < len(criteria_list) and criteria_list[slot_index] is not None:
+                if criteria_list[slot_index].get('deletable', True):
+                    new_list = criteria_list.copy()
+                    new_list.pop(slot_index)
+                    return [new_list] + update_criteria_display(new_list)
+            return [criteria_list] + update_criteria_display(criteria_list)
         
         def reset_to_defaults():
             """Reset criteria to defaults."""
-            return DEFAULT_CRITERIA.copy(), render_criteria_html(DEFAULT_CRITERIA), calculate_total_weight(DEFAULT_CRITERIA)
+            return [DEFAULT_CRITERIA.copy()] + update_criteria_display(DEFAULT_CRITERIA.copy())
         
         # Initialize criteria state on load
         def initialize_criteria():
             criteria = DEFAULT_CRITERIA.copy()
-            return criteria, render_criteria_html(criteria), calculate_total_weight(criteria)
+            return [criteria] + update_criteria_display(criteria)
         
         # Set up initial criteria
+        all_outputs = [criteria_state]
+        for i in range(20):
+            all_outputs.extend([
+                criterion_rows[i],
+                criterion_descriptions[i],
+                criterion_type_infos[i],
+                criterion_sliders[i],
+                criterion_delete_btns[i]
+            ])
+        all_outputs.append(total_weight_display)
+        
         demo.load(
             initialize_criteria,
-            outputs=[criteria_state, criteria_display, total_weight_display]
+            outputs=all_outputs
         )
         
         # Criteria management event handlers
         add_criterion_btn.click(
-            add_new_criterion,
+            show_add_criterion_dialog,
             inputs=[criteria_state],
-            outputs=[criteria_state, criteria_display, total_weight_display]
+            outputs=[add_criterion_dialog, total_weight_display]
+        )
+        
+        cancel_add_btn.click(
+            hide_add_criterion_dialog,
+            outputs=[add_criterion_dialog, new_criterion_description, new_criterion_type, new_criterion_weight]
+        )
+        
+        confirm_add_btn.click(
+            add_new_criterion_with_details,
+            inputs=[criteria_state, new_criterion_description, new_criterion_type, new_criterion_weight],
+            outputs=[criteria_state] + all_outputs[1:] + [add_criterion_dialog]
+        ).then(
+            lambda: ("", "boolean", 10),
+            outputs=[new_criterion_description, new_criterion_type, new_criterion_weight]
         )
         
         reset_criteria_btn.click(
             reset_to_defaults,
-            outputs=[criteria_state, criteria_display, total_weight_display]
+            outputs=all_outputs
         )
+        
+        # Set up weight slider handlers for each slot
+        for i in range(20):
+            criterion_sliders[i].change(
+                lambda weight, state, idx=i: update_criterion_weight(state, idx, weight),
+                inputs=[criterion_sliders[i], criteria_state],
+                outputs=[criteria_state, total_weight_display]
+            )
+        
+        # Set up delete button handlers for each slot
+        for i in range(20):
+            criterion_delete_btns[i].click(
+                lambda state, idx=i: delete_criterion(state, idx),
+                inputs=[criteria_state],
+                outputs=all_outputs
+            )
         
         # Modified analyze button to use persona and criteria
         def run_analysis_with_persona(case_text, num_articles, persona, criteria, progress=gr.Progress()):

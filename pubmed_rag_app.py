@@ -335,14 +335,44 @@ def init_clients(project_id, location):
 def load_journal_data():
     try:
         df = pd.read_csv(JOURNAL_IMPACT_CSV_URL, sep=';')
+        
+        # Debug: Log total journals loaded
+        print(f"\n=== JOURNAL DATA LOADING ===")
+        print(f"Total journals loaded: {len(df)}")
+        
         # Convert SJR values from string with commas to float
         sjr_dict = {}
+        valid_count = 0
+        invalid_count = 0
+        nan_examples = []
+        
         for _, row in df.iterrows():
             title = row['Title']
             sjr_str = str(row['SJR'])
-            # Remove commas and convert to float
-            sjr_value = float(sjr_str.replace(',', ''))
-            sjr_dict[title] = sjr_value
+            
+            try:
+                # Remove commas and convert to float
+                sjr_value = float(sjr_str.replace(',', ''))
+                if pd.isna(sjr_value):
+                    invalid_count += 1
+                    if len(nan_examples) < 3:  # Collect first 3 examples
+                        nan_examples.append(f"  - '{title}': SJR={sjr_str}")
+                else:
+                    sjr_dict[title] = sjr_value
+                    valid_count += 1
+            except (ValueError, AttributeError):
+                invalid_count += 1
+                if len(nan_examples) < 3:
+                    nan_examples.append(f"  - '{title}': SJR={sjr_str} (conversion error)")
+        
+        print(f"Journals with valid SJR values: {valid_count}")
+        print(f"Journals with invalid/NaN SJR values: {invalid_count}")
+        if nan_examples:
+            print("Examples of invalid journals:")
+            for example in nan_examples:
+                print(example)
+        print("=== END JOURNAL LOADING ===\n")
+        
         return sjr_dict
     except Exception as e:
         print(f"Error loading journal data: {e}")
@@ -429,16 +459,27 @@ def lookup_journal_impact_score(journal_title, journal_dict, genai_client):
     if not journal_title or not genai_client:
         return 0
     
+    print(f"\n=== JOURNAL LOOKUP DEBUG ===")
+    print(f"Looking up journal: '{journal_title}'")
+    
     try:
         # Build journal context for Gemini
-        journal_context = "\n".join([f"{title}: {int(float(sjr))}" for title, sjr in journal_dict.items()])
+        print(f"Total journals in dict: {len(journal_dict)}")
+        
+        journal_context = "\n".join([f"{title}: {sjr}" for title, sjr in journal_dict.items()])
+        print(f"Journal context length: {len(journal_context)} characters")
         
         prompt = f"""Given the journal title "{journal_title}", find the matching journal from the list below and return its SJR score.
 
 Journal SJR scores:
 {journal_context}
 
-Return the SJR score as an integer. If no match is found, return 0."""
+Return the SJR score as an integer. If no match is found or the score is NaN/invalid, return 0."""
+        
+        # Preview prompt
+        print(f"\nPROMPT PREVIEW (first 500 chars):")
+        print(prompt[:500])
+        print(f"... (truncated, total length: {len(prompt)} chars)")
         
         # Use structured response configuration
         from google.genai import types
@@ -455,17 +496,25 @@ Return the SJR score as an integer. If no match is found, return 0."""
             config=config
         )
         
+        # Debug Gemini response
+        print(f"\nGEMINI RAW RESPONSE:")
+        print(response.text)
+        
         # Parse JSON response
         try:
             result = json.loads(response.text)
             score = result.get('sjr_score', 0)
+            print(f"Parsed SJR score: {score}")
+            print("=== END DEBUG ===\n")
             return score if score >= 0 else 0
         except json.JSONDecodeError:
             print(f"Could not parse JSON response: {response.text}")
+            print("=== END DEBUG ===\n")
             return 0
             
     except Exception as e:
         print(f"Error looking up journal impact score: {e}")
+        print("=== END DEBUG ===\n")
         return 0
 
 def calculate_dynamic_score(metadata, criteria_list, journal_dict):

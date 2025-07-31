@@ -768,6 +768,9 @@ def create_app(share=False):
                     # Extract button
                     extract_btn = gr.Button("Extract", variant="secondary")
                     
+                    # Loading indicator
+                    extraction_loading = gr.Markdown("🔄 Extracting information...", visible=False)
+                    
                     # Extraction results box
                     with gr.Column(visible=False) as extraction_box:
                         extraction_display = gr.Markdown("")
@@ -1094,6 +1097,10 @@ def create_app(share=False):
         )
 
         # Case Tab Interactions
+        def show_extraction_loading():
+            """Show loading state when extraction starts."""
+            return gr.update(visible=True), gr.update(interactive=False)
+        
         def extract_and_display(case_text, disease_prompt, events_prompt):
             """Extract medical information and display results using custom prompts."""
             if not case_text.strip():
@@ -1102,7 +1109,9 @@ def create_app(share=False):
                     "",  # extraction_display
                     {"extracted": False, "disease": "", "events": ""},  # extraction_state
                     gr.update(interactive=False),  # proceed_button
-                    "❌ Please enter case notes first."  # case_status
+                    "❌ Please enter case notes first.",  # case_status
+                    gr.update(visible=False),  # extraction_loading
+                    gr.update(interactive=True)  # extract_btn
                 )
             
             if not genai_client:
@@ -1111,7 +1120,9 @@ def create_app(share=False):
                     "❌ Please complete setup first.",
                     {"extracted": False, "disease": "", "events": ""},
                     gr.update(interactive=False),
-                    ""
+                    "",
+                    gr.update(visible=False),  # extraction_loading
+                    gr.update(interactive=True)  # extract_btn
                 )
             
             try:
@@ -1133,7 +1144,9 @@ def create_app(share=False):
                     display_text,  # extraction_display
                     {"extracted": True, "disease": disease, "events": events},  # extraction_state
                     gr.update(interactive=True),  # proceed_button
-                    "✅ Information extracted successfully."  # case_status
+                    "✅ Information extracted successfully.",  # case_status
+                    gr.update(visible=False),  # extraction_loading
+                    gr.update(interactive=True)  # extract_btn
                 )
                 
             except Exception as e:
@@ -1142,14 +1155,19 @@ def create_app(share=False):
                     f"❌ Error extracting information: {str(e)}",
                     {"extracted": False, "disease": "", "events": ""},
                     gr.update(interactive=False),
-                    ""
+                    "",
+                    gr.update(visible=False),  # extraction_loading
+                    gr.update(interactive=True)  # extract_btn
                 )
         
         # Extract button click handler
         extract_btn.click(
+            show_extraction_loading,
+            outputs=[extraction_loading, extract_btn]
+        ).then(
             extract_and_display,
             inputs=[case_input, disease_prompt_input, events_prompt_input],
-            outputs=[extraction_box, extraction_display, extraction_state, proceed_to_persona_btn, case_status]
+            outputs=[extraction_box, extraction_display, extraction_state, proceed_to_persona_btn, case_status, extraction_loading, extract_btn]
         )
         
         # Enable/disable extract button based on case input

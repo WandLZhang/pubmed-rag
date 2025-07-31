@@ -364,7 +364,25 @@ def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_t
     print(f"Using BigQuery project: {bq_client.project}")
     print(f"Using embedding model: {embedding_model}")
     
-    sql = f"""SELECT base.PMID, base.content, base.text as abstract, distance FROM VECTOR_SEARCH(TABLE `{pubmed_table}`, 'ml_generate_embedding_result', (SELECT ml_generate_embedding_result FROM ML.GENERATE_EMBEDDING(MODEL `{embedding_model}`, (SELECT \"{query_text}\" AS content))), top_k => {top_k})"""
+    # Use DECLARE/SET pattern to safely handle special characters in query text
+    sql = f"""
+    DECLARE query_text STRING;
+    SET query_text = \"\"\"
+{query_text}
+\"\"\";
+    
+    SELECT base.PMID, base.content, base.text as abstract, distance 
+    FROM VECTOR_SEARCH(
+        TABLE `{pubmed_table}`, 
+        'ml_generate_embedding_result', 
+        (SELECT ml_generate_embedding_result 
+         FROM ML.GENERATE_EMBEDDING(
+             MODEL `{embedding_model}`, 
+             (SELECT query_text AS content)
+         )), 
+        top_k => {top_k}
+    )"""
+    
     return bq_client.query(sql).to_dataframe()
 
 def analyze_article_batch(df, disease, events, client, journal_dict):
@@ -870,11 +888,32 @@ def create_app(share=False):
                             confirm_add_btn = gr.Button("Add", variant="primary", size="sm")
                             cancel_add_btn = gr.Button("Cancel", size="sm")
                     
-                analyze_btn = gr.Button("Run Full Analysis", variant="primary", interactive=False)
+                analyze_btn = gr.Button("Retrieve and analyze articles", variant="primary", interactive=False)
                 analysis_status = gr.Markdown()
 
             with gr.TabItem("4. Results", id=4):
-                results_df = gr.DataFrame(label="Top 10 Ranked Articles")
+                # Progress tracking components
+                with gr.Row():
+                    analysis_progress = gr.Markdown("Ready to analyze articles.")
+                    stop_analysis_btn = gr.Button("Stop Analysis", variant="stop", visible=False)
+                
+                # Live results display
+                live_results_df = gr.DataFrame(
+                    label="Article Analysis Results (Live)",
+                    headers=["Score", "Title", "Journal", "Year", "Status"],
+                    interactive=False
+                )
+                
+                # Detailed analysis display
+                with gr.Accordion("Detailed Analysis", open=False) as analysis_accordion:
+                    detailed_analysis_html = gr.HTML()
+                
+                # Final summary
+                analysis_summary = gr.Markdown(visible=False)
+                
+                # State to track results
+                results_state = gr.State([])
+                analysis_active = gr.State(False)
 
         # --- Event Handlers for UI ---
         def initialize_credentials_and_proceed():
@@ -1355,52 +1394,371 @@ def create_app(share=False):
                 outputs=all_outputs
             )
         
-        # Modified analyze button to use persona and criteria
-        def run_analysis_with_persona(case_text, num_articles, persona, criteria, progress=gr.Progress()):
-            """Run analysis with custom persona and scoring criteria."""
+        # Generator function for progressive analysis
+        def run_analysis_generator(case_text, num_articles, persona, criteria, extraction_state):
+            """Generator that yields analysis progress updates."""
             if not genai_client or not bq_client:
-                return None, "❌ Please complete setup first.", {}, gr.update()
+                yield {"status": "error", "message": "❌ Please complete setup first."}
+                return
             
-            progress(0.1, desc="Extracting medical info...")
-            medical_info = extract_medical_info(case_text, genai_client)
-            disease = medical_info.get('disease', '')
-            events = [e.strip() for e in medical_info.get('events', '').split(',')]
-
-            progress(0.3, desc="Searching PubMed...")
-            embedding_model_path = f"{PROJECT_ID}.{USER_DATASET}.textembed"
-            articles_df = search_pubmed_articles(disease, events, bq_client, embedding_model_path, PUBMED_TABLE, num_articles)
-
-            progress(0.6, desc="Analyzing articles with custom criteria...")
-            # Modified to pass persona and criteria
-            analyses = analyze_article_batch_with_criteria(articles_df, disease, events, genai_client, journal_impact_dict, persona, criteria)
-
-            for i, analysis in enumerate(analyses):
-                for k, v in analysis.items():
-                    articles_df.loc[i, k] = v
-
-            # Use dynamic scoring
-            articles_df['score'] = articles_df.apply(
-                lambda row: calculate_dynamic_score(row, criteria, journal_impact_dict), 
-                axis=1
-            )
-            articles_df = articles_df.sort_values('score', ascending=False).reset_index()
-
-            progress(0.9, desc="Generating results...")
-            results_table = articles_df[['score', 'title', 'journal_title', 'year']].head(10)
-            results = {
-                'articles': articles_df.to_dict('records'), 
-                'disease': disease, 
-                'events': events, 
-                'case_text': case_text,
-                'persona': persona,
-                'criteria': criteria
-            }
-            return results_table, f"✅ Analysis complete for '{disease}'.", results, gr.update(selected=4)
+            try:
+                # Step 1: Use already extracted medical info
+                yield {"status": "starting", "message": "Starting analysis..."}
+                
+                disease = extraction_state.get('disease', '')
+                events = extraction_state.get('events', '')
+                events_list = [e.strip() for e in events.split(',') if e.strip()]
+                
+                # Step 2: Search PubMed
+                yield {"status": "searching", "message": f"Searching PubMed for articles about {disease}..."}
+                
+                embedding_model_path = f"{PROJECT_ID}.{USER_DATASET}.textembed"
+                articles_df = search_pubmed_articles(disease, events_list, bq_client, embedding_model_path, PUBMED_TABLE, num_articles)
+                
+                total_articles = len(articles_df)
+                yield {
+                    "status": "search_complete", 
+                    "message": f"Found {total_articles} articles. Starting analysis...",
+                    "total": total_articles
+                }
+                
+                # Step 3: Analyze articles one by one
+                analyzed_articles = []
+                
+                for idx, (_, article_row) in enumerate(articles_df.iterrows()):
+                    yield {
+                        "status": "analyzing",
+                        "current": idx + 1,
+                        "total": total_articles,
+                        "message": f"Analyzing article {idx + 1} of {total_articles}..."
+                    }
+                    
+                    # Analyze single article
+                    try:
+                        # Create a single-row DataFrame for this article
+                        single_article_df = pd.DataFrame([article_row])
+                        
+                        # Analyze with custom criteria
+                        analysis_results = analyze_article_batch_with_criteria(
+                            single_article_df, disease, events_list, genai_client, 
+                            journal_impact_dict, persona, criteria
+                        )
+                        
+                        if analysis_results and len(analysis_results) > 0:
+                            analysis = analysis_results[0]
+                            
+                            # Merge analysis results with article data
+                            article_data = article_row.to_dict()
+                            article_data.update(analysis)
+                            
+                            # Calculate score
+                            score = calculate_dynamic_score(analysis, criteria, journal_impact_dict)
+                            article_data['score'] = score
+                            
+                            analyzed_articles.append(article_data)
+                            
+                            # Yield the analyzed article
+                            yield {
+                                "status": "article_complete",
+                                "current": idx + 1,
+                                "total": total_articles,
+                                "article": {
+                                    "score": score,
+                                    "title": analysis.get('title', 'Unknown Title'),
+                                    "journal": analysis.get('journal_title', 'Unknown Journal'),
+                                    "year": analysis.get('year', 'N/A'),
+                                    "pmid": article_row.get('PMID', ''),
+                                    "metadata": analysis
+                                }
+                            }
+                        else:
+                            # Analysis failed for this article
+                            yield {
+                                "status": "article_failed",
+                                "current": idx + 1,
+                                "total": total_articles,
+                                "message": f"Failed to analyze article {idx + 1}"
+                            }
+                            
+                    except Exception as e:
+                        print(f"Error analyzing article {idx + 1}: {str(e)}")
+                        yield {
+                            "status": "article_failed",
+                            "current": idx + 1,
+                            "total": total_articles,
+                            "message": f"Error analyzing article {idx + 1}: {str(e)}"
+                        }
+                    
+                    # Add a small delay to avoid rate limiting
+                    if idx < total_articles - 1:
+                        time.sleep(1)
+                
+                # Step 4: Final results
+                yield {
+                    "status": "complete",
+                    "message": f"✅ Analysis complete! Analyzed {len(analyzed_articles)} articles.",
+                    "results": {
+                        'articles': analyzed_articles,
+                        'disease': disease,
+                        'events': events_list,
+                        'case_text': case_text,
+                        'persona': persona,
+                        'criteria': criteria
+                    }
+                }
+                
+            except Exception as e:
+                yield {
+                    "status": "error",
+                    "message": f"❌ Error during analysis: {str(e)}"
+                }
         
+        # Function to update the UI based on generator output
+        def update_analysis_display(progress_data, current_results, is_active):
+            """Update the display based on progress data."""
+            if not progress_data:
+                return [current_results, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), is_active]
+            
+            status = progress_data.get("status", "")
+            
+            if status == "error":
+                return [
+                    current_results,
+                    gr.update(value=progress_data.get("message", "Error")),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(visible=True, value=progress_data.get("message", "")),
+                    gr.update(visible=False),
+                    False
+                ]
+            
+            elif status == "starting":
+                return [
+                    [],  # Clear results
+                    gr.update(value="🔄 Starting analysis..."),
+                    gr.update(value=pd.DataFrame()),
+                    gr.update(value=""),
+                    gr.update(visible=False),
+                    gr.update(visible=True),
+                    True
+                ]
+            
+            elif status == "searching":
+                return [
+                    current_results,
+                    gr.update(value=f"🔍 {progress_data.get('message', '')}"),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    is_active
+                ]
+            
+            elif status == "search_complete":
+                return [
+                    current_results,
+                    gr.update(value=f"📚 {progress_data.get('message', '')}"),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    is_active
+                ]
+            
+            elif status == "analyzing":
+                current = progress_data.get("current", 0)
+                total = progress_data.get("total", 0)
+                progress_pct = (current / total * 100) if total > 0 else 0
+                return [
+                    current_results,
+                    gr.update(value=f"🔬 Analyzing article {current}/{total} ({progress_pct:.0f}%)"),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    is_active
+                ]
+            
+            elif status == "article_complete":
+                # Add the new article to results
+                new_results = current_results.copy() if current_results else []
+                article = progress_data.get("article", {})
+                new_results.append(article)
+                
+                # Sort by score descending
+                new_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+                
+                # Create DataFrame for display
+                df_data = []
+                for r in new_results:
+                    df_data.append({
+                        "Score": f"{r.get('score', 0):.1f}",
+                        "Title": r.get('title', 'Unknown')[:80] + "..." if len(r.get('title', '')) > 80 else r.get('title', 'Unknown'),
+                        "Journal": r.get('journal', 'Unknown'),
+                        "Year": r.get('year', 'N/A'),
+                        "Status": "✅ Analyzed"
+                    })
+                
+                display_df = pd.DataFrame(df_data)
+                
+                # Update detailed analysis HTML
+                detailed_html = "<div style='max-height: 400px; overflow-y: auto;'>"
+                for r in new_results[:5]:  # Show top 5 in detail
+                    detailed_html += f"""
+                    <div style='margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px;'>
+                        <h4 style='margin-top: 0;'>{r.get('title', 'Unknown')}</h4>
+                        <p><strong>Score:</strong> {r.get('score', 0):.1f} | 
+                           <strong>Journal:</strong> {r.get('journal', 'Unknown')} | 
+                           <strong>Year:</strong> {r.get('year', 'N/A')}</p>
+                        <p><strong>PMID:</strong> {r.get('pmid', 'N/A')}</p>
+                    </div>
+                    """
+                detailed_html += "</div>"
+                
+                current = progress_data.get("current", 0)
+                total = progress_data.get("total", 0)
+                
+                return [
+                    new_results,
+                    gr.update(value=f"🔬 Analyzed {current}/{total} articles"),
+                    gr.update(value=display_df),
+                    gr.update(value=detailed_html),
+                    gr.update(),
+                    gr.update(),
+                    is_active
+                ]
+            
+            elif status == "article_failed":
+                current = progress_data.get("current", 0)
+                total = progress_data.get("total", 0)
+                return [
+                    current_results,
+                    gr.update(value=f"⚠️ Article {current}/{total} failed - {progress_data.get('message', '')}"),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    is_active
+                ]
+            
+            elif status == "complete":
+                # Final update with all results
+                results = progress_data.get("results", {})
+                articles = results.get("articles", [])
+                
+                # Sort articles by score
+                articles.sort(key=lambda x: x.get("score", 0), reverse=True)
+                
+                # Create final DataFrame
+                df_data = []
+                for r in articles:
+                    df_data.append({
+                        "Score": f"{r.get('score', 0):.1f}",
+                        "Title": r.get('title', 'Unknown')[:80] + "..." if len(r.get('title', '')) > 80 else r.get('title', 'Unknown'),
+                        "Journal": r.get('journal_title', 'Unknown'),
+                        "Year": r.get('year', 'N/A'),
+                        "Status": "✅ Complete"
+                    })
+                
+                display_df = pd.DataFrame(df_data)
+                
+                # Summary message
+                summary = f"""
+                ### Analysis Summary
+                
+                - **Disease:** {results.get('disease', 'Unknown')}
+                - **Events:** {', '.join(results.get('events', []))}
+                - **Articles Analyzed:** {len(articles)}
+                - **Top Score:** {articles[0].get('score', 0):.1f} if articles else 'N/A'
+                
+                #### Top 3 Articles:
+                """
+                
+                for i, article in enumerate(articles[:3]):
+                    summary += f"\n{i+1}. **{article.get('title', 'Unknown')}** (Score: {article.get('score', 0):.1f})"
+                
+                return [
+                    articles,
+                    gr.update(value=progress_data.get("message", "")),
+                    gr.update(value=display_df),
+                    gr.update(),
+                    gr.update(visible=True, value=summary),
+                    gr.update(visible=False),
+                    False
+                ]
+            
+            return [current_results, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), is_active]
+        
+        # Function to handle the analysis button click
+        def start_analysis(case_text, num_articles, persona, criteria, extraction_state):
+            """Start the analysis and switch to results tab."""
+            if not extraction_state.get("extracted", False):
+                return (
+                    gr.update(value="❌ Please extract disease and events first."),
+                    gr.update(),
+                    gr.update()
+                )
+            
+            return (
+                gr.update(value=""),  # Clear status
+                gr.update(selected=4),  # Switch to results tab
+                gr.update()  # Update other components as needed
+            )
+        
+        # Function to run the analysis with proper generator handling
+        def run_full_analysis(case_text, num_articles, persona, criteria, extraction_state):
+            """Run the full analysis with progressive updates."""
+            # Initialize states
+            results = []
+            is_active = True
+            
+            # Create the generator
+            generator = run_analysis_generator(case_text, num_articles, persona, criteria, extraction_state)
+            
+            # Process each yield from the generator
+            for progress_data in generator:
+                if not is_active:  # Check if analysis was stopped
+                    break
+                    
+                # Update the display
+                results, progress_update, df_update, html_update, summary_update, stop_btn_update, is_active = update_analysis_display(
+                    progress_data, results, is_active
+                )
+                
+                # Yield the updates to Gradio
+                yield [
+                    results,  # results_state
+                    progress_update,  # analysis_progress
+                    df_update,  # live_results_df
+                    html_update,  # detailed_analysis_html
+                    summary_update,  # analysis_summary
+                    stop_btn_update,  # stop_analysis_btn
+                    is_active  # analysis_active
+                ]
+        
+        # Click handler for analyze button
         analyze_btn.click(
-            run_analysis_with_persona,
-            inputs=[case_input, num_articles_slider, persona_text, criteria_state],
-            outputs=[results_df, analysis_status, app_state, tabs]
+            start_analysis,
+            inputs=[case_input, num_articles_slider, persona_text, criteria_state, extraction_state],
+            outputs=[analysis_status, tabs, live_results_df]
+        ).then(
+            run_full_analysis,
+            inputs=[case_input, num_articles_slider, persona_text, criteria_state, extraction_state],
+            outputs=[results_state, analysis_progress, live_results_df, detailed_analysis_html, analysis_summary, stop_analysis_btn, analysis_active]
+        )
+        
+        # Stop button handler
+        def stop_analysis():
+            """Stop the ongoing analysis."""
+            return (
+                False,  # Set analysis_active to False
+                gr.update(value="⏹️ Analysis stopped by user."),
+                gr.update(visible=False)
+            )
+        
+        stop_analysis_btn.click(
+            stop_analysis,
+            outputs=[analysis_active, analysis_progress, stop_analysis_btn]
         )
 
         # Initial load

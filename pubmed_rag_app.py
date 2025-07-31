@@ -12,6 +12,7 @@ from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 from google import genai
+from google.genai import types
 from google.cloud import bigquery
 from google.cloud import resourcemanager_v3
 from google.cloud import service_usage_v1
@@ -334,8 +335,17 @@ def init_clients(project_id, location):
 def load_journal_data():
     try:
         df = pd.read_csv(JOURNAL_IMPACT_CSV_URL, sep=';')
-        return dict(zip(df['Title'], df['SJR']))
-    except:
+        # Convert SJR values from string with commas to float
+        sjr_dict = {}
+        for _, row in df.iterrows():
+            title = row['Title']
+            sjr_str = str(row['SJR'])
+            # Remove commas and convert to float
+            sjr_value = float(sjr_str.replace(',', ''))
+            sjr_dict[title] = sjr_value
+        return sjr_dict
+    except Exception as e:
+        print(f"Error loading journal data: {e}")
         return {}
 
 def extract_medical_info(case_text, client, disease_prompt=None, events_prompt=None):
@@ -371,7 +381,7 @@ def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_t
 {query_text}
 \"\"\";
     
-    SELECT base.PMID, base.content, base.text as abstract, distance 
+    SELECT base.PMID, base.content, distance 
     FROM VECTOR_SEARCH(
         TABLE `{pubmed_table}`, 
         'ml_generate_embedding_result', 
@@ -390,7 +400,7 @@ def analyze_article_batch(df, disease, events, client, journal_dict):
     prompt = f"""Analyze articles for relevance to Disease: {disease} and Events: {', '.join(events)}. Use this data: {journal_context}. For each, extract: title, journal_title, journal_sjr, year, disease_match (bool), pediatric_focus (bool), treatment_shown (bool), paper_type, key_findings, clinical_trial (bool), novel_findings (bool). Return JSON array."""
     articles_text = ""
     for _, row in df.iterrows():
-        content = row.get('content', row.get('abstract', ''))
+        content = row.get('content', '')
         articles_text += f"\n---\nPMID: {row['PMID']}\nContent: {content}\n"
     response = client.models.generate_content(model=MODEL_ID, contents=[prompt + articles_text], config=GenerateContentConfig(temperature=0, response_mime_type="application/json"))
     try:
@@ -414,9 +424,54 @@ def normalize_journal_score(sjr):
     # Cap at 25 points
     return min(normalized, 25)
 
+def lookup_journal_impact_score(journal_title, journal_dict, genai_client):
+    """Look up journal impact score using Gemini API with structured response."""
+    if not journal_title or not genai_client:
+        return 0
+    
+    try:
+        # Build journal context for Gemini
+        journal_context = "\n".join([f"{title}: {int(float(sjr))}" for title, sjr in journal_dict.items()])
+        
+        prompt = f"""Given the journal title "{journal_title}", find the matching journal from the list below and return its SJR score.
+
+Journal SJR scores:
+{journal_context}
+
+Return the SJR score as an integer. If no match is found, return 0."""
+        
+        # Use structured response configuration
+        from google.genai import types
+        
+        config = types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema={"type": "OBJECT", "properties": {"sjr_score": {"type": "INTEGER"}}}
+        )
+        
+        response = genai_client.models.generate_content(
+            model=MODEL_ID, 
+            contents=[prompt], 
+            config=config
+        )
+        
+        # Parse JSON response
+        try:
+            result = json.loads(response.text)
+            score = result.get('sjr_score', 0)
+            return score if score >= 0 else 0
+        except json.JSONDecodeError:
+            print(f"Could not parse JSON response: {response.text}")
+            return 0
+            
+    except Exception as e:
+        print(f"Error looking up journal impact score: {e}")
+        return 0
+
 def calculate_dynamic_score(metadata, criteria_list, journal_dict):
     """Calculate article score based on dynamic criteria configuration."""
     score = 0
+    breakdown = {}
     current_year = datetime.now().year
     
     for criterion in criteria_list:
@@ -428,109 +483,213 @@ def calculate_dynamic_score(metadata, criteria_list, journal_dict):
         criterion_name = criterion['name']
         
         if criterion_type == 'special_journal':
-            # Special handling for journal impact using SJR scores
+            # Look up journal impact score using Gemini
             journal_title = metadata.get('journal_title', '')
-            sjr = journal_dict.get(journal_title, 0)
+            sjr = lookup_journal_impact_score(journal_title, journal_dict, genai_client)
+            
             if sjr > 0:
-                impact_score = normalize_journal_score(sjr)
-                # Scale by user's weight (weight represents importance multiplier)
-                score += impact_score * (criterion['weight'] / 25)  # Normalize to 25 max
+                # Apply user's weight directly as a percentage
+                weighted_score = sjr * (criterion['weight'] / 100)
+                score += weighted_score
+                breakdown['journal_impact'] = round(weighted_score, 2)
                 
         elif criterion_type == 'special_year':
             # Year penalty: -5 points per year from current
-            if metadata.get('year'):
+            year_value = metadata.get('year')
+            if year_value is not None and year_value != '':
                 try:
-                    article_year = int(metadata.get('year'))
-                    year_diff = current_year - article_year
-                    year_penalty = -5 * year_diff
-                    # Apply user's weight as a multiplier
-                    score += year_penalty * criterion['weight']
-                except (ValueError, TypeError):
+                    # Handle both string and int types
+                    if isinstance(year_value, str):
+                        # Remove any quotes or whitespace
+                        year_value = year_value.strip().strip('"').strip("'")
+                    article_year = int(year_value)
+                    
+                    if article_year > 1900 and article_year <= current_year:  # Sanity check
+                        year_diff = current_year - article_year
+                        year_penalty = -5 * year_diff
+                        # Apply user's weight as a multiplier
+                        weighted_penalty = year_penalty * criterion['weight'] / 100  # Normalize weight
+                        score += weighted_penalty
+                        breakdown['year'] = round(weighted_penalty, 2)
+                except (ValueError, TypeError) as e:
+                    print(f"Warning: Could not process year '{year_value}': {e}")
                     pass
                     
         elif criterion_type == 'numeric':
             # For numeric criteria, multiply value by weight
             value = metadata.get(criterion_name, 0)
             if isinstance(value, (int, float)):
-                score += value * criterion['weight']
+                weighted_value = value * criterion['weight']
+                score += weighted_value
+                breakdown[criterion_name] = round(weighted_value, 2)
                 
         elif criterion_type == 'direct':
             # For direct scoring, use the value as-is (ignore weight)
             value = metadata.get(criterion_name, 0)
             if isinstance(value, (int, float)):
                 score += value
+                breakdown[criterion_name] = round(value, 2)
                 
         else:
             # Default: boolean criteria
             if metadata.get(criterion_name):
                 score += criterion['weight']
+                breakdown[criterion_name] = criterion['weight']
                 
-    return round(score, 2)
+    return round(score, 2), breakdown
 
-def analyze_article_batch_with_criteria(df, disease, events, client, journal_dict, persona, criteria):
-    """Analyze articles with custom persona and dynamic criteria."""
-    # Build journal context
-    journal_context = "\n".join([f"- {title}: {sjr}" for title, sjr in list(journal_dict.items())[:100]])  # Limit to first 100 for prompt size
+def build_dynamic_schema(criteria):
+    """Build dynamic BigQuery schema based on criteria configuration."""
+    # Start with standard fields
+    schema_parts = [
+        "title STRING",
+        "journal_title STRING", 
+        "year STRING", 
+        "paper_type STRING",
+        "actionable_events STRING"
+    ]
     
-    # Build criteria evaluation instructions dynamically from all criteria (except special ones)
-    criteria_instructions = []
+    # Add fields for each criterion based on type
     for criterion in criteria:
-        # Skip special criteria that are handled differently
-        if criterion['name'] not in ['journal_impact', 'year']:
+        if criterion['name'] not in ['journal_impact', 'year']:  # Skip special ones already handled
             if criterion['type'] == 'boolean':
-                criteria_instructions.append(f"- {criterion['name']} (boolean): {criterion['description']}")
-            elif criterion['type'] == 'numeric':
-                criteria_instructions.append(f"- {criterion['name']} (number): {criterion['description']}")
-            elif criterion['type'] == 'direct':
-                criteria_instructions.append(f"- {criterion['name']} (number 0-100): {criterion['description']}")
+                schema_parts.append(f"{criterion['name']} BOOL")
+            elif criterion['type'] in ['numeric', 'direct']:
+                schema_parts.append(f"{criterion['name']} INT64")
     
-    # Build the prompt with only standard fields hardcoded
-    criteria_text = "\n".join(criteria_instructions) if criteria_instructions else ""
+    return ",\n    ".join(schema_parts)
+
+def analyze_article_batch_with_criteria(df, disease, events, bq_client, journal_dict, persona, criteria):
+    """Analyze articles using AI.GENERATE_TABLE directly on BigQuery table."""
+    global PROJECT_ID, USER_DATASET, PUBMED_TABLE
     
-    prompt = f"""{persona}
+    if df.empty:
+        return []
+    
+    try:
+        # Build criteria instructions
+        criteria_instructions = []
+        for criterion in criteria:
+            if criterion['name'] not in ['journal_impact', 'year']:
+                if criterion['type'] == 'boolean':
+                    criteria_instructions.append(f"- {criterion['name']} (boolean): {criterion['description']}")
+                elif criterion['type'] == 'numeric':
+                    criteria_instructions.append(f"- {criterion['name']} (number): {criterion['description']} (Return 0 if unknown)")
+                elif criterion['type'] == 'direct':
+                    criteria_instructions.append(f"- {criterion['name']} (number 0-100): {criterion['description']} (Return 0 if no matches or unknown)")
+        
+        criteria_text = "\n".join(criteria_instructions) if criteria_instructions else ""
+        
+        # Build dynamic schema
+        schema = build_dynamic_schema(criteria)
+        
+        # Build the complete prompt in Python first
+        full_prompt = f"""{persona}
 
-Analyze the following articles for relevance to:
-- Disease: {disease}
-- Events: {', '.join(events)}
-
-Journal Impact Data (sample):
-{journal_context}
+Analyze this article for relevance to:
+Disease: {disease}
+Events: {', '.join(events)}
 
 For each article, extract the following information:
 1. Standard fields (always extract these):
-   - title: Article title
-   - journal_title: Name of the journal
-   - journal_sjr: SJR score from the provided list (or 0 if not found)
-   - year: Publication year
+   - title: Article title (if unknown, return empty string)
+   - journal_title: Name of the journal (if unknown, return empty string)
+   - year: Publication year as a string (e.g., "2023"). If unknown or not found, return empty string, NOT null or NaN
+   - paper_type: Type of paper (e.g., clinical trial, review, case report)
+   - actionable_events: Comma-separated list of events found in the article
 
 2. Evaluation criteria:
 {criteria_text}
 
-Return your analysis as a JSON array with one object per article.
+IMPORTANT: For all numeric fields, always return 0 instead of null, NaN, or leaving the field empty.
+
+Article content:
 """
-    
-    # Compile articles text
-    articles_text = ""
-    for _, row in df.iterrows():
-        content = row.get('content', row.get('abstract', ''))
-        articles_text += f"\n---\nPMID: {row['PMID']}\nContent: {content}\n"
-    
-    # Generate analysis
-    response = client.models.generate_content(
-        model=MODEL_ID, 
-        contents=[prompt + articles_text], 
-        config=GenerateContentConfig(temperature=0, response_mime_type="application/json")
-    )
-    
-    try:
-        return json.loads(response.text)
-    except json.JSONDecodeError:
-        print(f"Failed to parse JSON response: {response.text}")
+        
+        # Escape triple quotes if they appear in the prompt (unlikely but safe)
+        full_prompt_escaped = full_prompt.replace('"""', '\\"""')
+        
+        # Get PMIDs from dataframe
+        pmids = df['PMID'].tolist()
+        pmids_str = "', '".join(pmids)
+        
+        # Format schema for single line
+        schema_single_line = schema.replace('\n', ' ').replace('    ', '')
+        
+        # Construct AI.GENERATE_TABLE query using triple quotes
+        query = f'''
+        SELECT 
+            PMID,
+            * EXCEPT (PMID, prompt, full_response, status)
+        FROM 
+        AI.GENERATE_TABLE(
+            MODEL `{PROJECT_ID}.{USER_DATASET}.gemini_generation`,
+            (
+                SELECT 
+                    PMID,
+                    CONCAT(
+                        """{full_prompt_escaped}""",
+                        content
+                    ) AS prompt
+                FROM `{PUBMED_TABLE}`
+                WHERE PMID IN ('{pmids_str}')
+            ),
+            STRUCT(
+                """{schema_single_line}""" AS output_schema,
+                8192 AS max_output_tokens,
+                0 AS temperature,
+                0.95 AS top_p
+            )
+        )
+        '''
+        
+        # Execute query
+        results_df = bq_client.query(query).to_dataframe()
+        
+        # Convert to list of dictionaries and preserve article content
+        results = []
+        for _, result_row in results_df.iterrows():
+            result_dict = result_row.to_dict()
+            
+            # Clean up year field if it exists
+            if 'year' in result_dict:
+                year_val = result_dict['year']
+                if year_val in [None, 'NaN', 'nan', 'null', '']:
+                    result_dict['year'] = ''
+                elif isinstance(year_val, str):
+                    # Clean the year string
+                    result_dict['year'] = year_val.strip()
+            
+            # Clean up all INT64 fields (numeric and direct type criteria)
+            for criterion in criteria:
+                if criterion['type'] in ['numeric', 'direct'] and criterion['name'] in result_dict:
+                    field_value = result_dict[criterion['name']]
+                    # Handle NaN, null, or invalid values
+                    if pd.isna(field_value) or field_value in [None, 'NaN', 'nan', 'null', '']:
+                        result_dict[criterion['name']] = 0
+                    else:
+                        try:
+                            # Try to convert to int, default to 0 if it fails
+                            result_dict[criterion['name']] = int(float(str(field_value)))
+                        except (ValueError, TypeError):
+                            print(f"Warning: Could not convert {criterion['name']} value '{field_value}' to int, defaulting to 0")
+                            result_dict[criterion['name']] = 0
+            
+            # Find the corresponding content from the original df
+            matching_row = df[df['PMID'] == result_dict.get('PMID')]
+            if not matching_row.empty:
+                result_dict['content'] = matching_row.iloc[0]['content']
+            results.append(result_dict)
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error in AI.GENERATE_TABLE analysis: {str(e)}")
         return []
 
 def setup_bigquery(project, dataset, client, progress=gr.Progress()):
-    """Setup BigQuery dataset and model with retry logic."""
-    progress(0.8, desc="Setting up BigQuery dataset and model (may take a couple minutes if first time)...")
+    """Setup BigQuery dataset and models with retry logic."""
+    progress(0.8, desc="Setting up BigQuery dataset and models (may take a couple minutes if first time)...")
     
     # Create dataset if it doesn't exist
     try:
@@ -538,37 +697,48 @@ def setup_bigquery(project, dataset, client, progress=gr.Progress()):
     except:
         client.create_dataset(bigquery.Dataset(f"{project}.{dataset}"), exists_ok=True)
     
-    # Create model with retry logic
-    model_query = f"CREATE MODEL IF NOT EXISTS `{project}.{dataset}.textembed` REMOTE WITH CONNECTION DEFAULT OPTIONS(endpoint='text-embedding-005');"
+    # Create text embedding model
+    embed_model_query = f"CREATE MODEL IF NOT EXISTS `{project}.{dataset}.textembed` REMOTE WITH CONNECTION DEFAULT OPTIONS(endpoint='text-embedding-005');"
+    
+    # Create Gemini generation model
+    gen_model_query = f"CREATE MODEL IF NOT EXISTS `{project}.{dataset}.gemini_generation` REMOTE WITH CONNECTION DEFAULT OPTIONS(endpoint='gemini-2.5-pro');"
+    
+    models_to_create = [
+        ("text embedding", embed_model_query),
+        ("Gemini generation", gen_model_query)
+    ]
     
     max_retries = 3
     retry_delays = [5, 10, 15]
     
-    for attempt in range(max_retries):
-        try:
-            print(f"Creating BigQuery embedding model (attempt {attempt + 1}/{max_retries})...")
-            client.query(model_query).result()
-            print(f"Successfully created BigQuery model for {project}.{dataset}")
-            return f"✅ BigQuery setup complete for {project}.{dataset}"
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"Attempt {attempt + 1} failed: {error_msg}")
-            
-            # Check if it's a job execution error that might be timing-related
-            if "internal error during execution" in error_msg.lower() and attempt < max_retries - 1:
-                delay = retry_delays[attempt]
-                print(f"This appears to be a timing issue. Waiting {delay} seconds before retry...")
-                time.sleep(delay)
-            elif attempt < max_retries - 1:
-                # For other errors, also retry but with shorter delay
-                delay = retry_delays[attempt] // 2
-                print(f"Waiting {delay} seconds before retry...")
-                time.sleep(delay)
-            else:
-                # All retries exhausted
-                print(f"All {max_retries} attempts failed.")
-                raise Exception(f"Failed to create BigQuery model after {max_retries} attempts. Last error: {error_msg}")
+    for model_name, model_query in models_to_create:
+        for attempt in range(max_retries):
+            try:
+                print(f"Creating BigQuery {model_name} model (attempt {attempt + 1}/{max_retries})...")
+                client.query(model_query).result()
+                print(f"Successfully created {model_name} model for {project}.{dataset}")
+                break
+                
+            except Exception as e:
+                error_msg = str(e)
+                print(f"Attempt {attempt + 1} failed for {model_name}: {error_msg}")
+                
+                # Check if it's a job execution error that might be timing-related
+                if "internal error during execution" in error_msg.lower() and attempt < max_retries - 1:
+                    delay = retry_delays[attempt]
+                    print(f"This appears to be a timing issue. Waiting {delay} seconds before retry...")
+                    time.sleep(delay)
+                elif attempt < max_retries - 1:
+                    # For other errors, also retry but with shorter delay
+                    delay = retry_delays[attempt] // 2
+                    print(f"Waiting {delay} seconds before retry...")
+                    time.sleep(delay)
+                else:
+                    # All retries exhausted
+                    print(f"All {max_retries} attempts failed for {model_name}.")
+                    raise Exception(f"Failed to create {model_name} model after {max_retries} attempts. Last error: {error_msg}")
+    
+    return f"✅ BigQuery setup complete for {project}.{dataset}"
 
 # --- Gradio App Logic ---
 def get_initial_projects():
@@ -1456,9 +1626,9 @@ def create_app(share=False):
                         # Create a single-row DataFrame for this article
                         single_article_df = pd.DataFrame([article_row])
                         
-                        # Analyze with custom criteria
+                        # Analyze with custom criteria using BigQuery
                         analysis_results = analyze_article_batch_with_criteria(
-                            single_article_df, disease, events_list, genai_client, 
+                            single_article_df, disease, events_list, bq_client, 
                             journal_impact_dict, persona, criteria
                         )
                         
@@ -1469,9 +1639,14 @@ def create_app(share=False):
                             article_data = article_row.to_dict()
                             article_data.update(analysis)
                             
-                            # Calculate score
-                            score = calculate_dynamic_score(analysis, criteria, journal_impact_dict)
+                            # Calculate score and get breakdown
+                            score, point_breakdown = calculate_dynamic_score(analysis, criteria, journal_impact_dict)
                             article_data['score'] = score
+                            article_data['point_breakdown'] = point_breakdown
+                            
+                            # Ensure we have the full content
+                            article_data['content'] = article_row.get('content', '')
+                            article_data['pmid'] = article_row.get('PMID', '')
                             
                             analyzed_articles.append(article_data)
                             
@@ -1482,10 +1657,12 @@ def create_app(share=False):
                                 "total": total_articles,
                                 "article": {
                                     "score": score,
+                                    "point_breakdown": point_breakdown,
                                     "title": analysis.get('title', 'Unknown Title'),
                                     "journal": analysis.get('journal_title', 'Unknown Journal'),
                                     "year": analysis.get('year', 'N/A'),
                                     "pmid": article_row.get('PMID', ''),
+                                    "content": article_row.get('content', ''),
                                     "metadata": analysis
                                 }
                             }
@@ -1619,16 +1796,36 @@ def create_app(share=False):
                 
                 display_df = pd.DataFrame(df_data)
                 
-                # Update detailed analysis HTML
-                detailed_html = "<div style='max-height: 400px; overflow-y: auto;'>"
-                for r in new_results[:5]:  # Show top 5 in detail
+                # Update detailed analysis HTML with full functionality
+                detailed_html = "<div style='max-height: 600px; overflow-y: auto;'>"
+                for r in new_results[:10]:  # Show top 10 in detail
+                    # Format points breakdown
+                    breakdown_html = ""
+                    if r.get('point_breakdown'):
+                        for key, value in r.get('point_breakdown', {}).items():
+                            formatted_key = key.replace('_', ' ').title()
+                            color = 'green' if value > 0 else 'red'
+                            breakdown_html += f'<span style="color: {color}; margin-right: 15px;">{formatted_key}: {value:+.1f}</span>'
+                    
+                    # Get metadata for additional fields
+                    metadata = r.get('metadata', {})
+                    
                     detailed_html += f"""
                     <div style='margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px;'>
                         <h4 style='margin-top: 0;'>{r.get('title', 'Unknown')}</h4>
-                        <p><strong>Score:</strong> {r.get('score', 0):.1f} | 
-                           <strong>Journal:</strong> {r.get('journal', 'Unknown')} | 
-                           <strong>Year:</strong> {r.get('year', 'N/A')}</p>
-                        <p><strong>PMID:</strong> {r.get('pmid', 'N/A')}</p>
+                        <p>
+                            <strong>Score:</strong> {r.get('score', 0):.1f} | 
+                            <strong>Journal:</strong> {r.get('journal', 'Unknown')} | 
+                            <strong>Year:</strong> {r.get('year', 'N/A')}
+                        </p>
+                        <p><strong>PMID:</strong> <a href="https://pubmed.ncbi.nlm.nih.gov/{r.get('pmid', '')}/" target="_blank" style="color: #0066cc; text-decoration: underline;">{r.get('pmid', 'N/A')}</a></p>
+                        <p><strong>Points Breakdown:</strong><br/>{breakdown_html}</p>
+                        <details>
+                            <summary style="cursor: pointer; color: #0066cc;">View Article</summary>
+                            <div style="margin-top: 10px; padding: 10px; background-color: #f8f9fa; border-radius: 5px; max-height: 200px; overflow-y: auto;">
+                                <pre style="white-space: pre-wrap; font-family: inherit; margin: 0;">{r.get('content', 'No content available')[:1000]}...</pre>
+                            </div>
+                        </details>
                     </div>
                     """
                 detailed_html += "</div>"
@@ -1667,11 +1864,15 @@ def create_app(share=False):
                 # Sort articles by score
                 articles.sort(key=lambda x: x.get("score", 0), reverse=True)
                 
-                # Create final DataFrame
+                # Create final DataFrame with interactive elements
                 df_data = []
                 for r in articles:
+                    # Create a clickable PMID
+                    pmid_link = f'<a href="https://pubmed.ncbi.nlm.nih.gov/{r.get("pmid", "")}/" target="_blank">{r.get("pmid", "N/A")}</a>'
+                    
                     df_data.append({
                         "Score": f"{r.get('score', 0):.1f}",
+                        "PMID": r.get("pmid", "N/A"),
                         "Title": r.get('title', 'Unknown')[:80] + "..." if len(r.get('title', '')) > 80 else r.get('title', 'Unknown'),
                         "Journal": r.get('journal_title', 'Unknown'),
                         "Year": r.get('year', 'N/A'),
@@ -1680,6 +1881,120 @@ def create_app(share=False):
                 
                 display_df = pd.DataFrame(df_data)
                 
+                # Create enhanced detailed HTML
+                detailed_html = "<div style='max-height: 800px; overflow-y: auto;'>"
+                detailed_html += "<h3>Detailed Results</h3>"
+                
+                for idx, article in enumerate(articles):
+                    # Format points breakdown with better visibility
+                    breakdown_items = []
+                    total_positive = 0
+                    total_negative = 0
+                    
+                    if article.get('point_breakdown'):
+                        for key, value in article.get('point_breakdown', {}).items():
+                            formatted_key = key.replace('_', ' ').title()
+                            if value > 0:
+                                total_positive += value
+                                breakdown_items.append(f'<span style="color: #28a745; font-weight: bold;">{formatted_key}: +{value:.1f}</span>')
+                            elif value < 0:
+                                total_negative += value
+                                breakdown_items.append(f'<span style="color: #dc3545; font-weight: bold;">{formatted_key}: {value:.1f}</span>')
+                    
+                    # Get metadata
+                    metadata = article.get('metadata', article)
+                    
+                    # Create events display - handle string format
+                    events_html = ""
+                    actionable_events = metadata.get('actionable_events', '')
+                    if actionable_events:
+                        if isinstance(actionable_events, str):
+                            # Parse JSON string or split by comma
+                            try:
+                                import json as json_module
+                                events_list = json_module.loads(actionable_events)
+                            except:
+                                # Treat as comma-separated
+                                events_list = [e.strip() for e in actionable_events.split(',') if e.strip()]
+                        else:
+                            events_list = actionable_events
+                        
+                        # Process events
+                        if isinstance(events_list, list):
+                            for event in events_list:
+                                if isinstance(event, dict):
+                                    event_text = event.get('event', '')
+                                    matches = event.get('matches_query', False)
+                                    color = '#28a745' if matches else '#6c757d'
+                                    weight = 'bold' if matches else 'normal'
+                                    events_html += f'<span style="color: {color}; font-weight: {weight}; margin-right: 10px;">{event_text}</span>'
+                                else:
+                                    # Simple string
+                                    events_html += f'<span style="color: #6c757d; margin-right: 10px;">{event}</span>'
+                    
+                    # Paper type and other metadata
+                    paper_type = metadata.get('paper_type', 'Unknown')
+                    drugs_tested = 'Yes' if metadata.get('drugs_tested') else 'No'
+                    
+                    detailed_html += f"""
+                    <div style='margin: 20px 0; padding: 20px; border: 1px solid #dee2e6; border-radius: 8px; background-color: #ffffff;'>
+                        <div style='display: flex; justify-content: space-between; align-items: start;'>
+                            <h4 style='margin-top: 0; flex: 1;'>{idx + 1}. {article.get('title', 'Unknown')}</h4>
+                            <div style='text-align: right;'>
+                                <span style='font-size: 32px; font-weight: bold; color: #007bff; display: block;'>{article.get('score', 0):.1f}</span>
+                                <span style='font-size: 14px; color: #6c757d;'>Total Score</span>
+                            </div>
+                        </div>
+                        
+                        <div style='margin: 15px 0; padding: 15px; background-color: #f8f9fa; border-radius: 5px;'>
+                            <h5 style='margin-top: 0; color: #495057;'>📊 Score Breakdown</h5>
+                            <div style='margin: 10px 0;'>
+                                <div style='color: #28a745; margin-bottom: 5px;'>
+                                    <strong>Positive Points: +{total_positive:.1f}</strong>
+                                </div>
+                                <div style='color: #dc3545; margin-bottom: 10px;'>
+                                    <strong>Negative Points: {total_negative:.1f}</strong>
+                                </div>
+                                <div style='border-top: 1px solid #dee2e6; padding-top: 10px;'>
+                                    {' | '.join(breakdown_items) if breakdown_items else '<span style="color: #6c757d;">No scoring criteria matched</span>'}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style='margin: 10px 0;'>
+                            <strong>Journal:</strong> {article.get('journal_title', 'Unknown')} | 
+                            <strong>Year:</strong> {article.get('year', 'N/A')} | 
+                            <strong>Type:</strong> {paper_type}
+                        </div>
+                        
+                        <div style='margin: 10px 0;'>
+                            <strong>Links:</strong> 
+                            <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/" target="_blank" style="color: #0066cc; text-decoration: underline; margin-right: 15px;">
+                                🔗 PubMed (PMID: {article.get('pmid', 'N/A')})
+                            </a>
+                            <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/?format=pubmed" target="_blank" style="color: #0066cc; text-decoration: underline;">
+                                📄 Full Text (if available)
+                            </a>
+                        </div>
+                        
+                        <div style='margin: 10px 0;'>
+                            <strong>Actionable Events Found:</strong><br/>
+                            <div style='margin-top: 5px;'>
+                                {events_html if events_html else '<span style="color: #6c757d;">None found</span>'}
+                            </div>
+                        </div>
+                        
+                        <details style='margin-top: 15px;'>
+                            <summary style="cursor: pointer; color: #0066cc; font-weight: bold;">📑 View Article</summary>
+                            <div style="margin-top: 10px; padding: 15px; background-color: #f8f9fa; border-radius: 5px; max-height: 400px; overflow-y: auto;">
+                                <pre style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; font-size: 14px; line-height: 1.6; color: #212529;">{article.get('content', 'No content available')}</pre>
+                            </div>
+                        </details>
+                    </div>
+                    """
+                
+                detailed_html += "</div>"
+                
                 # Summary message
                 summary = f"""
                 ### Analysis Summary
@@ -1687,19 +2002,28 @@ def create_app(share=False):
                 - **Disease:** {results.get('disease', 'Unknown')}
                 - **Events:** {', '.join(results.get('events', []))}
                 - **Articles Analyzed:** {len(articles)}
-                - **Top Score:** {articles[0].get('score', 0):.1f} if articles else 'N/A'
-                
-                #### Top 3 Articles:
                 """
                 
-                for i, article in enumerate(articles[:3]):
-                    summary += f"\n{i+1}. **{article.get('title', 'Unknown')}** (Score: {article.get('score', 0):.1f})"
+                # Only add top score if articles exist
+                if articles and len(articles) > 0:
+                    summary += f"\n- **Top Score:** {articles[0].get('score', 0):.1f}"
+                else:
+                    summary += f"\n- **Top Score:** N/A"
+                
+                if articles:
+                    summary += "\n\n#### Top 5 Articles:\n"
+                    for i, article in enumerate(articles[:5]):
+                        summary += f"\n{i+1}. **{article.get('title', 'Unknown')}** (Score: {article.get('score', 0):.1f})"
+                        if article.get('pmid'):
+                            summary += f" - [PubMed](https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid')}/)"
+                else:
+                    summary += "\n\n⚠️ No articles were successfully analyzed. This may be due to API quota limits or processing errors."
                 
                 return [
                     articles,
                     gr.update(value=progress_data.get("message", "")),
                     gr.update(value=display_df),
-                    gr.update(),
+                    gr.update(value=detailed_html),
                     gr.update(visible=True, value=summary),
                     gr.update(visible=False),
                     False

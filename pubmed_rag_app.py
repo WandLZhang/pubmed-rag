@@ -26,11 +26,17 @@ import argparse
 # --- Constants ---
 PUBMED_DATASET = "wz-data-catalog-demo.pubmed"
 PUBMED_TABLE = f"{PUBMED_DATASET}.pmid_embed_nonzero_metadata"
-MODEL_ID = "gemini-2.5-flash"
+MODEL_ID = "gemini-2.5-flash-lite"  # Default model, will be updated dynamically
+THINKING_BUDGET = 0  # Default thinking budget, will be updated dynamically
 JOURNAL_IMPACT_CSV_URL = "https://raw.githubusercontent.com/WandLZhang/scimagojr_2024/main/scimagojr_2024.csv"
 REQUIRED_APIS = ["aiplatform.googleapis.com", "bigquery.googleapis.com", "cloudresourcemanager.googleapis.com"]
 CREATE_BILLING_ACCOUNT_URL = "https://console.cloud.google.com/billing/create?inv=1&invt=Ab4E_Q"
 CREATE_BILLING_ACCOUNT_OPTION = "→ Create New Billing Account"
+MODEL_OPTIONS = {
+    "Gemini 2.5 Flash Lite (Default)": "gemini-2.5-flash-lite",
+    "Gemini 2.5 Flash": "gemini-2.5-flash", 
+    "Gemini 2.5 Pro": "gemini-2.5-pro"
+}
 SAMPLE_CASE = """A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO DBH AML 2012 protocol. Post- MEC and ADE, MRD remained at 35% and 53%. Vyxeos-clofarabine therapy reduced MRD to 18%. Third-line FLAG-Mylotarg lowered MRD to 3.5% (flow) and 1% (molecular). After a cord blood HSCT in December 2022, she relapsed 10 months later with 3% MRD and femoral extramedullary disease.
 After the iLTB discussion, in November 2023 the patient was enrolled in the SNDX5613 trial, receiving revumenib for three months, leading to a reduction in KMT2A MRD to 0.1% by PCR. Subsequently, the patient underwent a second allogeneic HSCT using cord blood with treosulfan, thiotepa, and fludarabine conditioning, followed by revumenib maintenance. In August 2024, 6.5 months after the second HSCT, the patient experienced a bone marrow relapse with 33% blasts. The patient is currently in very good clinical condition.
 
@@ -45,15 +51,6 @@ journal_impact_dict = {}
 PROJECT_ID = ""
 LOCATION = "global"
 USER_DATASET = "pubmed"
-
-# Scoring presets
-SCORING_PRESETS = {
-    "Clinical Focus": {
-        "disease_match": 50,
-        "treatment_efficacy": 50,
-        "clinical_trial": 40
-    }
-}
 
 # Disease extraction prompt from gemini-medical-literature
 DISEASE_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify the primary disease.
@@ -226,10 +223,14 @@ def list_billing_accounts():
         print(f"Error listing billing accounts: {e}")
         return [CREATE_BILLING_ACCOUNT_OPTION]
 
-def create_new_project(project_id, billing_account_name, progress=gr.Progress()):
+def create_new_project(project_id, billing_account_name, model_endpoint, thinking_budget, progress=gr.Progress()):
     """Creates a new GCP project, links billing, and enables necessary APIs."""
-    global USER_CREDENTIALS
+    global USER_CREDENTIALS, MODEL_ID, THINKING_BUDGET
     try:
+        # Update global model settings
+        MODEL_ID = model_endpoint
+        THINKING_BUDGET = thinking_budget
+        
         progress(0.1, desc="Creating project...")
         project_client = resourcemanager_v3.ProjectsClient(credentials=USER_CREDENTIALS)
         project = {'project_id': project_id, 'display_name': project_id}
@@ -252,9 +253,9 @@ def create_new_project(project_id, billing_account_name, progress=gr.Progress())
         progress(0.7, desc="Waiting for project propagation...")
         time.sleep(10)  # 10-second delay for IAM permissions to propagate
 
-        # Use the shared setup logic
+        # Use the shared setup logic with model endpoint
         global genai_client, bq_client, journal_impact_dict
-        genai_client, bq_client, journal_impact_dict = setup_project(project_id, LOCATION, USER_DATASET, progress)
+        genai_client, bq_client, journal_impact_dict = setup_project(project_id, LOCATION, USER_DATASET, model_endpoint, progress)
 
         return f"✅ Project '{project_id}' created and set up.", f"{project_id} ({project_id})"
     except Exception as e:
@@ -276,7 +277,7 @@ def link_billing_to_project(project_id, billing_account_name):
         return False, f"❌ Error linking billing account: {e}"
 
 # --- Core Functions ---
-def setup_project(project_id, location, dataset, progress=gr.Progress()):
+def setup_project(project_id, location, dataset, model_endpoint, progress=gr.Progress()):
     """Common setup logic for both new and existing projects."""
     try:
         # Set environment variable
@@ -287,8 +288,8 @@ def setup_project(project_id, location, dataset, progress=gr.Progress()):
         if not genai_client or not bq_client:
             raise ConnectionError("Failed to initialize Google Cloud clients.")
 
-        # Setup BigQuery dataset and model
-        setup_bigquery(project_id, dataset, bq_client, progress)
+        # Setup BigQuery dataset and model with selected model endpoint
+        setup_bigquery(project_id, dataset, bq_client, model_endpoint, progress)
 
         progress(0.9, desc="Loading journal data...")
         journal_impact_dict = load_journal_data()
@@ -335,11 +336,7 @@ def init_clients(project_id, location):
 def load_journal_data():
     try:
         df = pd.read_csv(JOURNAL_IMPACT_CSV_URL, sep=';')
-        
-        # Debug: Log total journals loaded
-        print(f"\n=== JOURNAL DATA LOADING ===")
-        print(f"Total journals loaded: {len(df)}")
-        
+
         # Convert SJR values from string with commas to float
         sjr_dict = {}
         valid_count = 0
@@ -365,13 +362,9 @@ def load_journal_data():
                 if len(nan_examples) < 3:
                     nan_examples.append(f"  - '{title}': SJR={sjr_str} (conversion error)")
         
-        print(f"Journals with valid SJR values: {valid_count}")
-        print(f"Journals with invalid/NaN SJR values: {invalid_count}")
         if nan_examples:
-            print("Examples of invalid journals:")
             for example in nan_examples:
                 print(example)
-        print("=== END JOURNAL LOADING ===\n")
         
         return sjr_dict
     except Exception as e:
@@ -389,11 +382,25 @@ def extract_medical_info(case_text, client, disease_prompt=None, events_prompt=N
         events_prompt = EVENT_EXTRACTION_PROMPT
     
     full_disease_prompt = f"{disease_prompt}\n\nCase notes:\n{case_text}"
-    response = client.models.generate_content(model=MODEL_ID, contents=[full_disease_prompt], config=GenerateContentConfig(temperature=0))
+    response = client.models.generate_content(
+        model=MODEL_ID, 
+        contents=[full_disease_prompt], 
+        config=GenerateContentConfig(
+            temperature=0,
+            thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
+        )
+    )
     results["disease"] = response.text.strip()
     
     full_events_prompt = f"{events_prompt}\n\nCase notes:\n{case_text}"
-    response = client.models.generate_content(model=MODEL_ID, contents=[full_events_prompt], config=GenerateContentConfig(temperature=0))
+    response = client.models.generate_content(
+        model=MODEL_ID, 
+        contents=[full_events_prompt], 
+        config=GenerateContentConfig(
+            temperature=0,
+            thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
+        )
+    )
     results["events"] = response.text.strip()
     
     return results
@@ -425,26 +432,6 @@ def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_t
     
     return bq_client.query(sql).to_dataframe()
 
-def analyze_article_batch(df, disease, events, client, journal_dict):
-    journal_context = "\n".join([f"- {title}: {sjr}" for title, sjr in journal_dict.items()])
-    prompt = f"""Analyze articles for relevance to Disease: {disease} and Events: {', '.join(events)}. Use this data: {journal_context}. For each, extract: title, journal_title, journal_sjr, year, disease_match (bool), pediatric_focus (bool), treatment_shown (bool), paper_type, key_findings, clinical_trial (bool), novel_findings (bool). Return JSON array."""
-    articles_text = ""
-    for _, row in df.iterrows():
-        content = row.get('content', '')
-        articles_text += f"\n---\nPMID: {row['PMID']}\nContent: {content}\n"
-    response = client.models.generate_content(model=MODEL_ID, contents=[prompt + articles_text], config=GenerateContentConfig(temperature=0, response_mime_type="application/json"))
-    try:
-        return json.loads(response.text)
-    except json.JSONDecodeError:
-        return []
-
-def calculate_article_score(metadata, config):
-    score = 0
-    if metadata.get('disease_match'): score += config.get('disease_match', 50)
-    if metadata.get('treatment_shown'): score += config.get('treatment_efficacy', 50)
-    if metadata.get('clinical_trial'): score += config.get('clinical_trial', 40)
-    return round(score, 2)
-
 def normalize_journal_score(sjr):
     """Normalize journal SJR score using logarithmic scale (from gemini-medical-literature)."""
     if not sjr or sjr <= 0:
@@ -459,15 +446,9 @@ def lookup_journal_impact_score(journal_title, journal_dict, genai_client):
     if not journal_title or not genai_client:
         return 0
     
-    print(f"\n=== JOURNAL LOOKUP DEBUG ===")
-    print(f"Looking up journal: '{journal_title}'")
-    
     try:
         # Build journal context for Gemini
-        print(f"Total journals in dict: {len(journal_dict)}")
-        
         journal_context = "\n".join([f"{title}: {sjr}" for title, sjr in journal_dict.items()])
-        print(f"Journal context length: {len(journal_context)} characters")
         
         prompt = f"""Given the journal title "{journal_title}", find the matching journal from the list below and return its SJR score.
 
@@ -476,18 +457,14 @@ Journal SJR scores:
 
 Return the SJR score as an integer. If no match is found or the score is NaN/invalid, return 0."""
         
-        # Preview prompt
-        print(f"\nPROMPT PREVIEW (first 500 chars):")
-        print(prompt[:500])
-        print(f"... (truncated, total length: {len(prompt)} chars)")
-        
         # Use structured response configuration
         from google.genai import types
         
         config = types.GenerateContentConfig(
             temperature=0,
             response_mime_type="application/json",
-            response_schema={"type": "OBJECT", "properties": {"sjr_score": {"type": "INTEGER"}}}
+            response_schema={"type": "OBJECT", "properties": {"sjr_score": {"type": "INTEGER"}}},
+            thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
         )
         
         response = genai_client.models.generate_content(
@@ -496,25 +473,16 @@ Return the SJR score as an integer. If no match is found or the score is NaN/inv
             config=config
         )
         
-        # Debug Gemini response
-        print(f"\nGEMINI RAW RESPONSE:")
-        print(response.text)
-        
         # Parse JSON response
         try:
             result = json.loads(response.text)
             score = result.get('sjr_score', 0)
-            print(f"Parsed SJR score: {score}")
-            print("=== END DEBUG ===\n")
             return score if score >= 0 else 0
         except json.JSONDecodeError:
-            print(f"Could not parse JSON response: {response.text}")
-            print("=== END DEBUG ===\n")
             return 0
             
     except Exception as e:
         print(f"Error looking up journal impact score: {e}")
-        print("=== END DEBUG ===\n")
         return 0
 
 def calculate_dynamic_score(metadata, criteria_list, journal_dict):
@@ -736,7 +704,7 @@ Article content:
         print(f"Error in AI.GENERATE_TABLE analysis: {str(e)}")
         return []
 
-def setup_bigquery(project, dataset, client, progress=gr.Progress()):
+def setup_bigquery(project, dataset, client, model_endpoint, progress=gr.Progress()):
     """Setup BigQuery dataset and models with retry logic."""
     progress(0.8, desc="Setting up BigQuery dataset and models (may take a couple minutes if first time)...")
     
@@ -749,8 +717,8 @@ def setup_bigquery(project, dataset, client, progress=gr.Progress()):
     # Create text embedding model
     embed_model_query = f"CREATE MODEL IF NOT EXISTS `{project}.{dataset}.textembed` REMOTE WITH CONNECTION DEFAULT OPTIONS(endpoint='text-embedding-005');"
     
-    # Create Gemini generation model
-    gen_model_query = f"CREATE MODEL IF NOT EXISTS `{project}.{dataset}.gemini_generation` REMOTE WITH CONNECTION DEFAULT OPTIONS(endpoint='gemini-2.5-pro');"
+    # Create Gemini generation model with dynamic model endpoint
+    gen_model_query = f"CREATE OR REPLACE MODEL `{project}.{dataset}.gemini_generation` REMOTE WITH CONNECTION DEFAULT OPTIONS(endpoint='{model_endpoint}');"
     
     models_to_create = [
         ("text embedding", embed_model_query),
@@ -799,14 +767,18 @@ def get_initial_projects():
     choices = [f"{p['name']} ({p['id']})" for p in projects]
     return gr.update(choices=choices, value=choices[0] if choices else None), f"✅ Found {len(projects)} projects. Select a project and click Proceed."
 
-def proceed_with_project(project_selection, progress=gr.Progress()):
+def proceed_with_project(project_selection, model_selection, thinking_budget, progress=gr.Progress()):
     """Check and set up the selected project, then move to the next tab."""
-    global genai_client, bq_client, journal_impact_dict, PROJECT_ID, LOCATION, USER_DATASET
+    global genai_client, bq_client, journal_impact_dict, PROJECT_ID, LOCATION, USER_DATASET, MODEL_ID, THINKING_BUDGET
     if not project_selection:
         return "❌ Please select a project first.", gr.update(interactive=False), gr.update()
 
     project_id = project_selection.split('(')[-1].rstrip(')')
     PROJECT_ID = project_id
+    
+    # Update global model settings
+    MODEL_ID = MODEL_OPTIONS[model_selection]
+    THINKING_BUDGET = thinking_budget
     
     # Clear any existing project environment variable
     if 'GOOGLE_CLOUD_PROJECT' in os.environ:
@@ -827,42 +799,14 @@ def proceed_with_project(project_selection, progress=gr.Progress()):
         if missing_apis:
             enable_apis(project_id, missing_apis, progress)
 
-        # Use the shared setup logic
-        genai_client, bq_client, journal_impact_dict = setup_project(PROJECT_ID, LOCATION, USER_DATASET, progress)
+        # Use the shared setup logic with model endpoint
+        genai_client, bq_client, journal_impact_dict = setup_project(PROJECT_ID, LOCATION, USER_DATASET, MODEL_ID, progress)
 
-        status = f"✅ Setup complete for {PROJECT_ID}! You can now analyze a case."
+        status = f"✅ Setup complete for {PROJECT_ID} with model {model_selection}! You can now analyze a case."
         return status, gr.update(interactive=True), gr.update(selected=2)
 
     except Exception as e:
         return f"❌ Error: {e}", gr.update(interactive=False), gr.update()
-
-def run_analysis(case_text, num_articles, progress=gr.Progress()):
-    if not genai_client or not bq_client:
-        return None, "❌ Please complete setup first.", {}, gr.update()
-    progress(0.1, desc="Extracting medical info...")
-    medical_info = extract_medical_info(case_text, genai_client)
-    disease = medical_info.get('disease', '')
-    events = [e.strip() for e in medical_info.get('events', '').split(',')]
-
-    progress(0.3, desc="Searching PubMed...")
-    embedding_model_path = f"{PROJECT_ID}.{USER_DATASET}.textembed"
-    articles_df = search_pubmed_articles(disease, events, bq_client, embedding_model_path, PUBMED_TABLE, num_articles)
-
-    progress(0.6, desc="Analyzing articles...")
-    analyses = analyze_article_batch(articles_df, disease, events, genai_client, journal_impact_dict)
-
-    for i, analysis in enumerate(analyses):
-        for k, v in analysis.items():
-            articles_df.loc[i, k] = v
-
-    scoring_config = SCORING_PRESETS["Clinical Focus"]
-    articles_df['score'] = articles_df.apply(lambda row: calculate_article_score(row, scoring_config), axis=1)
-    articles_df = articles_df.sort_values('score', ascending=False).reset_index()
-
-    progress(0.9, desc="Generating results...")
-    results_table = articles_df[['score', 'title', 'journal_title', 'year']].head(10)
-    results = {'articles': articles_df.to_dict('records'), 'disease': disease, 'events': events, 'case_text': case_text}
-    return results_table, f"✅ Analysis complete for '{disease}'.", results, gr.update(selected=4)
 
 def create_app(share=False):
     """Create and return the Gradio app."""
@@ -946,6 +890,30 @@ def create_app(share=False):
                     billing_status = gr.Markdown()
 
                 with gr.Column() as setup_details_box:
+                    # Model Configuration Section
+                    gr.Markdown("### 🤖 Model Configuration")
+                    
+                    with gr.Row():
+                        model_dropdown = gr.Dropdown(
+                            label="Select Model",
+                            choices=list(MODEL_OPTIONS.keys()),
+                            value="Gemini 2.5 Flash Lite (Default)",
+                            interactive=True,
+                            info="Choose the Gemini model to use for analysis"
+                        )
+                    
+                    with gr.Row():
+                        thinking_budget_slider = gr.Slider(
+                            label="Thinking Budget",
+                            minimum=0,
+                            maximum=24576,
+                            value=0,
+                            step=1,
+                            interactive=True,
+                            info="Set the thinking budget for model responses (0 = default)"
+                        )
+                    
+                    gr.Markdown("---")
                     proceed_btn = gr.Button("Proceed", variant="primary")
 
             with gr.TabItem("2. Case", id=2):
@@ -1171,8 +1139,10 @@ def create_app(share=False):
             # Valid billing account selected, hide the message
             return gr.update(), gr.update(visible=False)
 
-        def handle_project_creation(project_id, billing_account, progress=gr.Progress()):
-            status, new_project_selection = create_new_project(project_id, billing_account, progress)
+        def handle_project_creation(project_id, billing_account, model_dropdown, thinking_budget_slider, progress=gr.Progress()):
+            # Get the model endpoint from the dropdown selection
+            model_endpoint = MODEL_OPTIONS[model_dropdown]
+            status, new_project_selection = create_new_project(project_id, billing_account, model_endpoint, thinking_budget_slider, progress)
             if new_project_selection:
                 projects = list_projects()
                 choices = [f"{p['name']} ({p['id']})" for p in projects]
@@ -1188,7 +1158,7 @@ def create_app(share=False):
         billing_account_dropdown.change(handle_billing_selection, inputs=[billing_account_dropdown], outputs=[billing_account_dropdown, billing_link_message])
         create_project_submit_btn.click(
             handle_project_creation, 
-            inputs=[new_project_id_input, billing_account_dropdown], 
+            inputs=[new_project_id_input, billing_account_dropdown, model_dropdown, thinking_budget_slider], 
             outputs=[create_project_box, setup_details_box, project_dropdown, status_output, tabs]
         )
         def handle_billing_setup_selection(billing_account):
@@ -1203,7 +1173,7 @@ def create_app(share=False):
             # Valid billing account selected, hide the message
             return gr.update(), gr.update(visible=False)
 
-        def handle_link_billing(billing_account, project_dropdown, progress=gr.Progress()):
+        def handle_link_billing(billing_account, project_dropdown, model_dropdown, thinking_budget_slider, progress=gr.Progress()):
             """Handle linking billing account to the project."""
             if not billing_account or billing_account == CREATE_BILLING_ACCOUNT_OPTION:
                 return "❌ Please select a valid billing account.", gr.update(visible=True), gr.update(visible=False)
@@ -1214,8 +1184,8 @@ def create_app(share=False):
             success, message = link_billing_to_project(project_id, billing_account)
             if success:
                 progress(0.3, desc="Billing linked! Continuing setup...")
-                # After successful billing link, continue with the normal setup
-                status, analyze_btn_update, tabs_update = proceed_with_project(project_dropdown, progress)
+                # After successful billing link, continue with the normal setup with model settings
+                status, analyze_btn_update, tabs_update = proceed_with_project(project_dropdown, model_dropdown, thinking_budget_slider, progress)
                 # Return appropriate updates for this function's outputs
                 # The .then() chains will handle the analyze button and tabs updates based on the status message
                 return status, gr.update(visible=False), gr.update(visible=True)
@@ -1226,9 +1196,9 @@ def create_app(share=False):
         needs_billing_setup = gr.State(False)
         
         # Modified proceed button click handler
-        def handle_proceed_click(project_dropdown, progress=gr.Progress()):
+        def handle_proceed_click(project_dropdown, model_dropdown, thinking_budget_slider, progress=gr.Progress()):
             """Handle the proceed button click."""
-            status, analyze_btn_update, tabs_update = proceed_with_project(project_dropdown, progress)
+            status, analyze_btn_update, tabs_update = proceed_with_project(project_dropdown, model_dropdown, thinking_budget_slider, progress)
             
             if status == "billing_needed":
                 # Show billing setup box and populate dropdown
@@ -1256,7 +1226,7 @@ def create_app(share=False):
         
         proceed_btn.click(
             handle_proceed_click, 
-            inputs=[project_dropdown], 
+            inputs=[project_dropdown, model_dropdown, thinking_budget_slider], 
             outputs=[status_output, analyze_btn, tabs, billing_setup_box, setup_details_box, billing_setup_dropdown, needs_billing_setup]
         )
 
@@ -1297,7 +1267,7 @@ def create_app(share=False):
         
         link_billing_output = link_billing_btn.click(
             handle_link_billing,
-            inputs=[billing_setup_dropdown, project_dropdown],
+            inputs=[billing_setup_dropdown, project_dropdown, model_dropdown, thinking_budget_slider],
             outputs=[status_output, billing_setup_box, setup_details_box]
         )
         

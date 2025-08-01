@@ -300,7 +300,7 @@ def setup_project(project_id, location, dataset, model_endpoint, progress=gr.Pro
         setup_bigquery(project_id, dataset, bq_client, model_endpoint, progress)
 
         progress(0.9, desc="Loading journal data...")
-        journal_impact_dict = load_journal_data()
+        journal_impact_dict = load_journal_data(bq_client)
         
         return genai_client, bq_client, journal_impact_dict
     except Exception as e:
@@ -341,40 +341,118 @@ def init_clients(project_id, location):
                 print(f"All {max_retries} attempts failed. Error initializing clients for project {project_id}: {e}")
                 return None, None
 
-def load_journal_data():
+def load_journal_data(bq_client_param=None):
+    """Load journal data from BigQuery instead of CSV."""
     try:
-        df = pd.read_csv(JOURNAL_IMPACT_CSV_URL, sep=';')
-
-        # Convert SJR values from string with commas to float
-        sjr_dict = {}
-        valid_count = 0
-        invalid_count = 0
-        nan_examples = []
-        
-        for _, row in df.iterrows():
-            title = row['Title']
-            sjr_str = str(row['SJR'])
+        # Use provided client or global client
+        client = bq_client_param or bq_client
+        if client is None:
+            print("BigQuery client not initialized")
+            return {}
             
-            try:
-                # Remove commas and convert to float
-                sjr_value = float(sjr_str.replace(',', ''))
-                if pd.isna(sjr_value):
-                    invalid_count += 1
-                    if len(nan_examples) < 3:  # Collect first 3 examples
-                        nan_examples.append(f"  - '{title}': SJR={sjr_str}")
-                else:
-                    sjr_dict[title] = sjr_value
-                    valid_count += 1
-            except (ValueError, AttributeError):
-                invalid_count += 1
-                if len(nan_examples) < 3:
-                    nan_examples.append(f"  - '{title}': SJR={sjr_str} (conversion error)")
+        query = f"""
+        SELECT 
+            journal_title,
+            sjr
+        FROM `{PROJECT_ID}.{USER_DATASET}.journal_impact`
+        WHERE sjr IS NOT NULL
+        ORDER BY sjr DESC
+        """
         
+        print("Loading journal data from BigQuery...")
+        start_time = time.time()
         
+        results = client.query(query).to_dataframe()
+        
+        # Convert to dictionary
+        sjr_dict = {}
+        for _, row in results.iterrows():
+            sjr_dict[row['journal_title']] = row['sjr']
+        
+        load_time = time.time() - start_time
+        print(f"✅ Loaded {len(sjr_dict)} journals from BigQuery in {load_time:.2f} seconds")
         return sjr_dict
+        
     except Exception as e:
-        print(f"Error loading journal data: {e}")
+        print(f"Error loading journal data from BigQuery: {e}")
         return {}
+
+def setup_journal_impact_table(bq_client, project_id, dataset_id, progress=gr.Progress()):
+    """Create and populate journal impact table if it doesn't exist."""
+    table_id = "journal_impact"
+    table_ref = f"{project_id}.{dataset_id}.{table_id}"
+    
+    try:
+        # Check if table exists
+        try:
+            table = bq_client.get_table(table_ref)
+            print(f"Journal impact table already exists with {table.num_rows} rows")
+            return True
+        except:
+            # Table doesn't exist, create it
+            progress(0.85, desc="Creating journal impact table...")
+            print(f"Creating journal impact table: {table_ref}")
+            
+            # Download and parse CSV
+            import pandas as pd
+            df = pd.read_csv(JOURNAL_IMPACT_CSV_URL, sep=';')
+            
+            # Convert SJR values from string with commas to float
+            df['SJR_float'] = df['SJR'].apply(lambda x: float(str(x).replace(',', '')) if pd.notna(x) and str(x) != '' else None)
+            
+            # Select relevant columns and rename
+            columns_to_keep = {
+                'Title': 'journal_title',
+                'SJR_float': 'sjr',
+                'Issn': 'issn',
+                'SJR Best Quartile': 'sjr_best_quartile',
+                'H index': 'h_index',
+                'Publisher': 'publisher',
+                'Categories': 'categories',
+                'Country': 'country',
+                'Type': 'type'
+            }
+            
+            df_clean = df[list(columns_to_keep.keys())].rename(columns=columns_to_keep)
+            
+            # Remove rows with no SJR value
+            df_clean = df_clean[df_clean['sjr'].notna()]
+            
+            print(f"Cleaned data: {len(df_clean)} rows with valid SJR values")
+            
+            # Define table schema
+            schema = [
+                bigquery.SchemaField("journal_title", "STRING"),
+                bigquery.SchemaField("sjr", "FLOAT64"),
+                bigquery.SchemaField("issn", "STRING"),
+                bigquery.SchemaField("sjr_best_quartile", "STRING"),
+                bigquery.SchemaField("h_index", "INT64"),
+                bigquery.SchemaField("publisher", "STRING"),
+                bigquery.SchemaField("categories", "STRING"),
+                bigquery.SchemaField("country", "STRING"),
+                bigquery.SchemaField("type", "STRING"),
+            ]
+            
+            # Configure load job
+            job_config = bigquery.LoadJobConfig(
+                schema=schema,
+                write_disposition="WRITE_TRUNCATE",
+            )
+            
+            # Load data
+            print(f"Uploading {len(df_clean)} rows to {table_ref}...")
+            job = bq_client.load_table_from_dataframe(df_clean, table_ref, job_config=job_config)
+            job.result()  # Wait for job to complete
+            
+            # Verify upload
+            table = bq_client.get_table(table_ref)
+            print(f"✅ Successfully created journal impact table with {table.num_rows} rows")
+            return True
+            
+    except Exception as e:
+        print(f"Error setting up journal impact table: {e}")
+        # Continue without journal impact data
+        return False
 
 def extract_medical_info(case_text, client, disease_prompt=None, events_prompt=None):
     """Extract medical information using custom or default prompts."""
@@ -452,6 +530,8 @@ def lookup_journal_impact_score(journal_title, journal_dict, genai_client):
         return 0
     
     try:
+        start_time = time.time()
+        
         # Build journal context for Gemini
         journal_context = "\n".join([f"{title}: {sjr}" for title, sjr in journal_dict.items()])
         
@@ -482,8 +562,12 @@ Return the SJR score as an integer. If no match is found or the score is NaN/inv
         try:
             result = json.loads(response.text)
             score = result.get('sjr_score', 0)
+            lookup_time = time.time() - start_time
+            print(f"   🔍 Gemini journal lookup for '{journal_title}' took {lookup_time:.2f} seconds (found SJR: {score})")
             return score if score >= 0 else 0
         except json.JSONDecodeError:
+            lookup_time = time.time() - start_time
+            print(f"   🔍 Gemini journal lookup for '{journal_title}' took {lookup_time:.2f} seconds (parse error)")
             return 0
             
     except Exception as e:
@@ -593,6 +677,8 @@ def analyze_article_batch_with_criteria(df, disease, events, bq_client, journal_
         return []
     
     try:
+        print(f"\n📊 Starting AI.GENERATE_TABLE analysis for {len(df)} article(s)...")
+        ai_start_time = time.time()
         # Build criteria instructions
         criteria_instructions = []
         for criterion in criteria:
@@ -670,9 +756,13 @@ Article content:
         '''
         
         # Execute query
+        query_execution_start = time.time()
         results_df = bq_client.query(query).to_dataframe()
+        query_execution_time = time.time() - query_execution_start
+        print(f"   ⚡ AI.GENERATE_TABLE query executed in {query_execution_time:.2f} seconds")
         
         # Convert to list of dictionaries and preserve article content
+        processing_start = time.time()
         results = []
         for _, result_row in results_df.iterrows():
             result_dict = result_row.to_dict()
@@ -707,6 +797,9 @@ Article content:
                 result_dict['content'] = matching_row.iloc[0]['content']
             results.append(result_dict)
         
+        total_ai_time = time.time() - ai_start_time
+        print(f"   ✅ Total AI.GENERATE_TABLE analysis took {total_ai_time:.2f} seconds")
+        
         return results
         
     except Exception as e:
@@ -722,6 +815,9 @@ def setup_bigquery(project, dataset, client, model_endpoint, progress=gr.Progres
         client.get_dataset(f"{project}.{dataset}")
     except:
         client.create_dataset(bigquery.Dataset(f"{project}.{dataset}"), exists_ok=True)
+    
+    # Setup journal impact table
+    setup_journal_impact_table(client, project, dataset, progress)
     
     # Create text embedding model
     embed_model_query = f"CREATE MODEL IF NOT EXISTS `{project}.{dataset}.textembed` REMOTE WITH CONNECTION DEFAULT OPTIONS(endpoint='text-embedding-005');"
@@ -1768,6 +1864,8 @@ def create_app(share=False):
                     
                     # Analyze single article
                     try:
+                        article_start_time = time.time()
+                        
                         # Create a single-row DataFrame for this article
                         single_article_df = pd.DataFrame([article_row])
                         
@@ -1785,7 +1883,11 @@ def create_app(share=False):
                             article_data.update(analysis)
                             
                             # Calculate score and get breakdown
+                            score_start_time = time.time()
                             score, point_breakdown = calculate_dynamic_score(analysis, criteria, journal_impact_dict)
+                            score_time = time.time() - score_start_time
+                            print(f"   🧮 Score calculation took {score_time:.2f} seconds")
+                            
                             article_data['score'] = score
                             article_data['point_breakdown'] = point_breakdown
                             
@@ -1794,6 +1896,9 @@ def create_app(share=False):
                             article_data['pmid'] = article_row.get('PMID', '')
                             
                             analyzed_articles.append(article_data)
+                            
+                            article_total_time = time.time() - article_start_time
+                            print(f"   ⏱️  Total time for article {idx + 1}: {article_total_time:.2f} seconds\n")
                             
                             # Yield the analyzed article
                             yield {

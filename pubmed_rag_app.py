@@ -847,6 +847,38 @@ def create_app(share=False):
     .extraction-result * {
         color: #212529 !important;  /* Ensure all child elements have dark text */
     }
+    .article-card {
+        margin: 20px 0;
+        padding: 20px;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        background-color: #e8f4f8;  /* Light blue background */
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .score-breakdown-box {
+        margin: 15px 0;
+        padding: 15px;
+        background-color: #d1ecf1;  /* Slightly darker blue */
+        border-radius: 5px;
+        border: 1px solid #bee5eb;
+    }
+    .article-content-box {
+        margin-top: 10px;
+        padding: 15px;
+        background-color: #ffffff;  /* White background for article text */
+        border-radius: 5px;
+        max-height: 600px;
+        overflow-y: auto;
+        border: 1px solid #dee2e6;
+    }
+    .article-content-box pre {
+        white-space: pre-wrap;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        margin: 0;
+        font-size: 14px;
+        line-height: 1.6;
+        color: #212529 !important;  /* Black text for readability */
+    }
     """
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="sky"), css=css) as demo:
         gr.Markdown("# 🏥 PubMed Literature Analysis")
@@ -1122,15 +1154,16 @@ def create_app(share=False):
                     analysis_progress = gr.Markdown("Ready to analyze articles.")
                     stop_analysis_btn = gr.Button("Stop Analysis", variant="stop", visible=False)
                 
-                # Live results display
+                # Live results display - hidden as it's redundant
                 live_results_df = gr.DataFrame(
                     label="Article Analysis Results (Live)",
                     headers=["Score", "Title", "Journal", "Year", "Status"],
-                    interactive=False
+                    interactive=False,
+                    visible=False  # Hide the redundant table
                 )
                 
-                # Detailed analysis display
-                with gr.Accordion("Detailed Analysis", open=False) as analysis_accordion:
+                # Detailed analysis display - expanded by default
+                with gr.Accordion("Detailed Analysis", open=True) as analysis_accordion:
                     detailed_analysis_html = gr.HTML()
                 
                 # Final summary
@@ -1820,6 +1853,103 @@ def create_app(share=False):
                     "message": f"❌ Error during analysis: {str(e)}"
                 }
         
+        # Helper function to generate article HTML card
+        def generate_article_html(article, idx):
+            """Generate consistent HTML for an article card."""
+            # Format points breakdown with better visibility
+            breakdown_items = []
+            
+            if article.get('point_breakdown'):
+                for key, value in article.get('point_breakdown', {}).items():
+                    formatted_key = key.replace('_', ' ').title()
+                    if value > 0:
+                        breakdown_items.append(f'<span style="color: #28a745; font-weight: bold;">{formatted_key}: +{value:.1f}</span>')
+                    elif value < 0:
+                        breakdown_items.append(f'<span style="color: #dc3545; font-weight: bold;">{formatted_key}: {value:.1f}</span>')
+            
+            # Get metadata
+            metadata = article.get('metadata', article)
+            
+            # Create events display - handle string format
+            events_html = ""
+            actionable_events = metadata.get('actionable_events', '')
+            if actionable_events:
+                if isinstance(actionable_events, str):
+                    # Parse JSON string or split by comma
+                    try:
+                        import json as json_module
+                        events_list = json_module.loads(actionable_events)
+                    except:
+                        # Treat as comma-separated
+                        events_list = [e.strip() for e in actionable_events.split(',') if e.strip()]
+                else:
+                    events_list = actionable_events
+                
+                # Process events
+                if isinstance(events_list, list):
+                    for event in events_list:
+                        if isinstance(event, dict):
+                            event_text = event.get('event', '')
+                            matches = event.get('matches_query', False)
+                            color = '#28a745' if matches else '#6c757d'
+                            weight = 'bold' if matches else 'normal'
+                            events_html += f'<span style="color: {color}; font-weight: {weight}; margin-right: 10px;">{event_text}</span>'
+                        else:
+                            # Simple string
+                            events_html += f'<span style="color: #6c757d; margin-right: 10px;">{event}</span>'
+            
+            # Paper type and other metadata
+            paper_type = metadata.get('paper_type', 'Unknown')
+            
+            return f"""
+            <div class='article-card'>
+                <div style='display: flex; justify-content: space-between; align-items: start;'>
+                    <h4 style='margin-top: 0; flex: 1; color: #212529;'>{idx + 1}. {article.get('title', 'Unknown')}</h4>
+                    <div style='text-align: right;'>
+                        <span style='font-size: 32px; font-weight: bold; color: #007bff; display: block;'>{article.get('score', 0):.1f}</span>
+                        <span style='font-size: 14px; color: #6c757d;'>Total Score</span>
+                    </div>
+                </div>
+                
+                <div class='score-breakdown-box'>
+                    <h5 style='margin-top: 0; color: #495057;'>📊 Score Breakdown</h5>
+                    <div style='margin: 10px 0;'>
+                        {' | '.join(breakdown_items) if breakdown_items else '<span style="color: #6c757d;">No scoring criteria matched</span>'}
+                    </div>
+                </div>
+                
+                <div style='margin: 10px 0; color: #212529;'>
+                    <strong style='color: #212529;'>Journal:</strong> {article.get('journal_title', metadata.get('journal_title', 'Unknown'))} | 
+                    <strong style='color: #212529;'>Year:</strong> {article.get('year', metadata.get('year', 'N/A'))} | 
+                    <strong style='color: #212529;'>Type:</strong> {paper_type}
+                </div>
+                
+                <div style='margin: 10px 0;'>
+                    <strong style='color: #212529;'>Links:</strong> 
+                    <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/" target="_blank" style="color: #0066cc; text-decoration: underline; margin-right: 15px;">
+                        🔗 PubMed (PMID: {article.get('pmid', 'N/A')})
+                    </a>
+                    <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/?format=pubmed" target="_blank" style="color: #0066cc; text-decoration: underline;">
+                        📄 Full Text (if available)
+                    </a>
+                </div>
+                
+                <div style='margin: 10px 0;'>
+                    <strong style='color: #212529;'>Actionable Events Found:</strong><br/>
+                    <div style='margin-top: 5px;'>
+                        {events_html if events_html else '<span style="color: #6c757d;">None found</span>'}
+                    </div>
+                </div>
+                
+                <details style='margin-top: 15px;'>
+                    <summary style="cursor: pointer; color: #0066cc; font-weight: bold;">📑 View Full Article</summary>
+                    <div class='article-content-box'>
+                        <pre>{article.get('content', 'No content available')}</pre>
+                    </div>
+                </details>
+            </div>
+            """
+        
         # Function to update the UI based on generator output
         def update_analysis_display(progress_data, current_results, is_active):
             """Update the display based on progress data."""
@@ -1908,38 +2038,10 @@ def create_app(share=False):
                 
                 display_df = pd.DataFrame(df_data)
                 
-                # Update detailed analysis HTML with full functionality
-                detailed_html = "<div style='max-height: 600px; overflow-y: auto;'>"
-                for r in new_results[:10]:  # Show top 10 in detail
-                    # Format points breakdown
-                    breakdown_html = ""
-                    if r.get('point_breakdown'):
-                        for key, value in r.get('point_breakdown', {}).items():
-                            formatted_key = key.replace('_', ' ').title()
-                            color = 'green' if value > 0 else 'red'
-                            breakdown_html += f'<span style="color: {color}; margin-right: 15px;">{formatted_key}: {value:+.1f}</span>'
-                    
-                    # Get metadata for additional fields
-                    metadata = r.get('metadata', {})
-                    
-                    detailed_html += f"""
-                    <div style='margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px;'>
-                        <h4 style='margin-top: 0;'>{r.get('title', 'Unknown')}</h4>
-                        <p>
-                            <strong>Score:</strong> {r.get('score', 0):.1f} | 
-                            <strong>Journal:</strong> {r.get('journal', 'Unknown')} | 
-                            <strong>Year:</strong> {r.get('year', 'N/A')}
-                        </p>
-                        <p><strong>PMID:</strong> <a href="https://pubmed.ncbi.nlm.nih.gov/{r.get('pmid', '')}/" target="_blank" style="color: #0066cc; text-decoration: underline;">{r.get('pmid', 'N/A')}</a></p>
-                        <p><strong>Points Breakdown:</strong><br/>{breakdown_html}</p>
-                        <details>
-                            <summary style="cursor: pointer; color: #0066cc;">View Article</summary>
-                            <div style="margin-top: 10px; padding: 10px; background-color: #f8f9fa; border-radius: 5px; max-height: 200px; overflow-y: auto;">
-                                <pre style="white-space: pre-wrap; font-family: inherit; margin: 0;">{r.get('content', 'No content available')[:1000]}...</pre>
-                            </div>
-                        </details>
-                    </div>
-                    """
+                # Update detailed analysis HTML using consistent generator
+                detailed_html = "<div style='max-height: 800px; overflow-y: auto;'>"
+                for idx, r in enumerate(new_results[:10]):  # Show top 10 in detail
+                    detailed_html += generate_article_html(r, idx)
                 detailed_html += "</div>"
                 
                 current = progress_data.get("current", 0)
@@ -1979,9 +2081,6 @@ def create_app(share=False):
                 # Create final DataFrame with interactive elements
                 df_data = []
                 for r in articles:
-                    # Create a clickable PMID
-                    pmid_link = f'<a href="https://pubmed.ncbi.nlm.nih.gov/{r.get("pmid", "")}/" target="_blank">{r.get("pmid", "N/A")}</a>'
-                    
                     df_data.append({
                         "Score": f"{r.get('score', 0):.1f}",
                         "PMID": r.get("pmid", "N/A"),
@@ -1993,117 +2092,12 @@ def create_app(share=False):
                 
                 display_df = pd.DataFrame(df_data)
                 
-                # Create enhanced detailed HTML
+                # Create enhanced detailed HTML using consistent generator
                 detailed_html = "<div style='max-height: 800px; overflow-y: auto;'>"
                 detailed_html += "<h3>Detailed Results</h3>"
                 
                 for idx, article in enumerate(articles):
-                    # Format points breakdown with better visibility
-                    breakdown_items = []
-                    total_positive = 0
-                    total_negative = 0
-                    
-                    if article.get('point_breakdown'):
-                        for key, value in article.get('point_breakdown', {}).items():
-                            formatted_key = key.replace('_', ' ').title()
-                            if value > 0:
-                                total_positive += value
-                                breakdown_items.append(f'<span style="color: #28a745; font-weight: bold;">{formatted_key}: +{value:.1f}</span>')
-                            elif value < 0:
-                                total_negative += value
-                                breakdown_items.append(f'<span style="color: #dc3545; font-weight: bold;">{formatted_key}: {value:.1f}</span>')
-                    
-                    # Get metadata
-                    metadata = article.get('metadata', article)
-                    
-                    # Create events display - handle string format
-                    events_html = ""
-                    actionable_events = metadata.get('actionable_events', '')
-                    if actionable_events:
-                        if isinstance(actionable_events, str):
-                            # Parse JSON string or split by comma
-                            try:
-                                import json as json_module
-                                events_list = json_module.loads(actionable_events)
-                            except:
-                                # Treat as comma-separated
-                                events_list = [e.strip() for e in actionable_events.split(',') if e.strip()]
-                        else:
-                            events_list = actionable_events
-                        
-                        # Process events
-                        if isinstance(events_list, list):
-                            for event in events_list:
-                                if isinstance(event, dict):
-                                    event_text = event.get('event', '')
-                                    matches = event.get('matches_query', False)
-                                    color = '#28a745' if matches else '#6c757d'
-                                    weight = 'bold' if matches else 'normal'
-                                    events_html += f'<span style="color: {color}; font-weight: {weight}; margin-right: 10px;">{event_text}</span>'
-                                else:
-                                    # Simple string
-                                    events_html += f'<span style="color: #6c757d; margin-right: 10px;">{event}</span>'
-                    
-                    # Paper type and other metadata
-                    paper_type = metadata.get('paper_type', 'Unknown')
-                    drugs_tested = 'Yes' if metadata.get('drugs_tested') else 'No'
-                    
-                    detailed_html += f"""
-                    <div style='margin: 20px 0; padding: 20px; border: 1px solid #dee2e6; border-radius: 8px; background-color: #ffffff;'>
-                        <div style='display: flex; justify-content: space-between; align-items: start;'>
-                            <h4 style='margin-top: 0; flex: 1;'>{idx + 1}. {article.get('title', 'Unknown')}</h4>
-                            <div style='text-align: right;'>
-                                <span style='font-size: 32px; font-weight: bold; color: #007bff; display: block;'>{article.get('score', 0):.1f}</span>
-                                <span style='font-size: 14px; color: #6c757d;'>Total Score</span>
-                            </div>
-                        </div>
-                        
-                        <div style='margin: 15px 0; padding: 15px; background-color: #f8f9fa; border-radius: 5px;'>
-                            <h5 style='margin-top: 0; color: #495057;'>📊 Score Breakdown</h5>
-                            <div style='margin: 10px 0;'>
-                                <div style='color: #28a745; margin-bottom: 5px;'>
-                                    <strong>Positive Points: +{total_positive:.1f}</strong>
-                                </div>
-                                <div style='color: #dc3545; margin-bottom: 10px;'>
-                                    <strong>Negative Points: {total_negative:.1f}</strong>
-                                </div>
-                                <div style='border-top: 1px solid #dee2e6; padding-top: 10px;'>
-                                    {' | '.join(breakdown_items) if breakdown_items else '<span style="color: #6c757d;">No scoring criteria matched</span>'}
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div style='margin: 10px 0;'>
-                            <strong>Journal:</strong> {article.get('journal_title', 'Unknown')} | 
-                            <strong>Year:</strong> {article.get('year', 'N/A')} | 
-                            <strong>Type:</strong> {paper_type}
-                        </div>
-                        
-                        <div style='margin: 10px 0;'>
-                            <strong>Links:</strong> 
-                            <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/" target="_blank" style="color: #0066cc; text-decoration: underline; margin-right: 15px;">
-                                🔗 PubMed (PMID: {article.get('pmid', 'N/A')})
-                            </a>
-                            <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/?format=pubmed" target="_blank" style="color: #0066cc; text-decoration: underline;">
-                                📄 Full Text (if available)
-                            </a>
-                        </div>
-                        
-                        <div style='margin: 10px 0;'>
-                            <strong>Actionable Events Found:</strong><br/>
-                            <div style='margin-top: 5px;'>
-                                {events_html if events_html else '<span style="color: #6c757d;">None found</span>'}
-                            </div>
-                        </div>
-                        
-                        <details style='margin-top: 15px;'>
-                            <summary style="cursor: pointer; color: #0066cc; font-weight: bold;">📑 View Article</summary>
-                            <div style="margin-top: 10px; padding: 15px; background-color: #f8f9fa; border-radius: 5px; max-height: 400px; overflow-y: auto;">
-                                <pre style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; font-size: 14px; line-height: 1.6; color: #212529;">{article.get('content', 'No content available')}</pre>
-                            </div>
-                        </details>
-                    </div>
-                    """
+                    detailed_html += generate_article_html(article, idx)
                 
                 detailed_html += "</div>"
                 

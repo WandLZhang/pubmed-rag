@@ -69,30 +69,28 @@ Examples:
 Output only the disease name. No additional text or formatting.
 """
 
-# Events extraction prompt from gemini-medical-literature
-EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify the 5 MOST SERIOUS events that are critical for treatment decisions and prognosis.
+# Events extraction prompt - updated to extract general concepts for better literature matching
+EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify key disease concepts and clinical features for literature search.
 
-Task: Identify and rank ALL clinically relevant events by severity, then output ONLY the TOP 5 most serious events.
-
-Severity Ranking (from most to least serious):
-1. Treatment failures and relapses (e.g., "relapsed after HSCT", "refractory to multiple lines")
-2. Life-threatening complications (e.g., "CNS involvement", "extramedullary disease")
-3. High-risk genetic alterations (e.g., "KMT2A rearrangement", "TP53 mutation")
-4. Poor treatment responses (e.g., "MRD 35% after induction", "no response to therapy")
-5. Critical biomarkers affecting prognosis (e.g., "FLT3-ITD positive", "complex karyotype")
+Task: Extract 5 general medical concepts that would help find relevant literature. Focus on:
+- Disease types and subtypes (e.g., "AML", "T-ALL", "B-ALL")
+- Genetic alterations (gene names only, e.g., "KMT2A rearrangement", "FLT3 mutation", "TP53 mutation")
+- Treatment modalities (e.g., "HSCT", "chemotherapy", "CAR-T therapy", "stem cell transplant")
+- General complications (e.g., "relapse", "refractory disease", "CNS involvement", "MRD positive")
+- Anatomical sites or disease features (e.g., "bone marrow", "extramedullary disease")
 
 Instructions:
-- First identify ALL events in the case
-- Then select EXACTLY 5 most serious events based on the severity ranking
-- Prioritize events that indicate poor prognosis or treatment challenges
-- Include specific values/percentages when available (e.g., "MRD 33%")
+- Extract GENERAL CONCEPTS that appear in medical literature
+- DO NOT include patient-specific details like percentages, timeframes, or specific protocol names
+- Focus on searchable medical terms
+- Output exactly 5 concepts
 
 Example:
-Input: "A 4-year-old female with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO protocol. MRD remained at 35%. She relapsed 10 months after cord blood HSCT with 33% blasts. WES showed KMT2A::MLLT3 fusion and NRAS mutation. Flow showed CD33 and CD123 positive."
+Input: "A 4-year-old female with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO protocol. MRD remained at 35%. She relapsed 10 months after cord blood HSCT with 33% blasts. WES showed KMT2A::MLLT3 fusion and NRAS mutation."
 
-Output: "relapsed after HSCT with 33% blasts" "refractory disease after NOPHO protocol" "KMT2A::MLLT3 fusion" "CNS2 involvement" "MRD 35% after induction"
+Output: "AML" "KMT2A rearrangement" "CNS involvement" "refractory disease" "HSCT relapse"
 
-Output only the 5 most serious events, one per line in quotes. No additional text or formatting.
+Output only 5 general medical concepts, one per line in quotes. No additional text or formatting.
 """
 
 # --- Helper Functions for Enhanced Setup ---
@@ -486,13 +484,36 @@ def extract_medical_info(case_text, client, disease_prompt=None, events_prompt=N
     )
     results["events"] = response.text.strip()
     
+    # Generate event IDs for the extracted events
+    events_text = results["events"]
+    events_list = []
+    events_with_ids = {}
+    
+    # Parse events (handle both line-separated and quote-separated formats)
+    if '"' in events_text:
+        # Events are in quotes
+        import re
+        events_list = re.findall(r'"([^"]+)"', events_text)
+    else:
+        # Events are line-separated
+        events_list = [e.strip() for e in events_text.split('\n') if e.strip()]
+    
+    # Create ID mapping
+    for i, event in enumerate(events_list, 1):
+        event_id = f"event_{i}"
+        events_with_ids[event_id] = event
+    
+    results["events_list"] = events_list
+    results["events_with_ids"] = events_with_ids
+    
     return results
 
-def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_table, top_k):
+def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_table, top_k, offset=0):
     query_text = f"{disease} {' '.join(events)}"
     # Debug: print the project being used
     print(f"Using BigQuery project: {bq_client.project}")
     print(f"Using embedding model: {embedding_model}")
+    print(f"Searching with top_k={top_k}, offset={offset}")
     
     # Use DECLARE/SET pattern to safely handle special characters in query text
     sql = f"""
@@ -501,17 +522,24 @@ def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_t
 {query_text}
 \"\"\";
     
-    SELECT base.PMID, base.content, distance 
-    FROM VECTOR_SEARCH(
-        TABLE `{pubmed_table}`, 
-        'ml_generate_embedding_result', 
-        (SELECT ml_generate_embedding_result 
-         FROM ML.GENERATE_EMBEDDING(
-             MODEL `{embedding_model}`, 
-             (SELECT query_text AS content)
-         )), 
-        top_k => {top_k}
-    )"""
+    WITH vector_results AS (
+        SELECT base.name AS PMCID, base.PMID, base.content, distance 
+        FROM VECTOR_SEARCH(
+            TABLE `{pubmed_table}`, 
+            'ml_generate_embedding_result', 
+            (SELECT ml_generate_embedding_result 
+             FROM ML.GENERATE_EMBEDDING(
+                 MODEL `{embedding_model}`, 
+                 (SELECT query_text AS content)
+             )), 
+            top_k => {top_k + offset}
+        )
+    )
+    SELECT * FROM vector_results
+    ORDER BY distance
+    LIMIT {top_k}
+    OFFSET {offset}
+    """
     
     return bq_client.query(sql).to_dataframe()
 
@@ -648,6 +676,94 @@ def calculate_dynamic_score(metadata, criteria_list, journal_dict):
                 
     return round(score, 2), breakdown
 
+def analyze_event_coverage_batch(df, disease, events_with_ids, bq_client):
+    """Phase 1: Analyze articles for event coverage using AI.GENERATE_TABLE."""
+    global PROJECT_ID, USER_DATASET, PUBMED_TABLE
+    
+    if df.empty:
+        return []
+    
+    try:
+        print(f"\n📊 Phase 1: Checking event coverage for {len(df)} article(s)...")
+        coverage_start_time = time.time()
+        
+        # Build event list with IDs for the prompt
+        event_list_text = "\n".join([f"- {event_id}: \"{event_text}\"" 
+                                     for event_id, event_text in events_with_ids.items()])
+        
+        # Simple prompt focused only on event detection
+        coverage_prompt = f"""You are analyzing medical literature to identify which events from a patient case are mentioned in each article.
+
+Master events from patient case:
+{event_list_text}
+
+For this article, identify which events are mentioned or discussed. Return ONLY the event IDs (e.g., "event_1,event_3") for events that are clearly present in the article. If no events are found, return an empty string.
+
+Article content:
+"""
+        
+        # Escape triple quotes if needed
+        coverage_prompt_escaped = coverage_prompt.replace('"""', '\\"""')
+        
+        # Get PMCIDs from dataframe (using name field as primary identifier)
+        # Handle cases where PMCID might be None
+        pmcids = [str(pmcid) for pmcid in df['PMCID'].tolist() if pmcid is not None]
+        if not pmcids:
+            print("Warning: No valid PMCIDs found in batch")
+            return []
+        pmcids_str = "', '".join(pmcids)
+        
+        # Simple schema for event coverage
+        schema = "event_ids STRING"
+        
+        # Construct AI.GENERATE_TABLE query for batch processing using PMCID
+        query = f'''
+        SELECT 
+            name AS PMCID,
+            event_ids
+        FROM 
+        AI.GENERATE_TABLE(
+            MODEL `{PROJECT_ID}.{USER_DATASET}.gemini_generation`,
+            (
+                SELECT 
+                    name AS PMCID,
+                    CONCAT(
+                        """{coverage_prompt_escaped}""",
+                        content
+                    ) AS prompt
+                FROM `{PUBMED_TABLE}`
+                WHERE name IN ('{pmcids_str}')
+            ),
+            STRUCT(
+                "{schema}" AS output_schema,
+                4096 AS max_output_tokens,
+                0 AS temperature,
+                0.95 AS top_p
+            )
+        )
+        '''
+        
+        # Execute query
+        results_df = bq_client.query(query).to_dataframe()
+        
+        # Convert to list of dictionaries
+        results = []
+        for _, row in results_df.iterrows():
+            result = {
+                'PMCID': row['PMCID'],
+                'event_ids': row.get('event_ids', '').strip()
+            }
+            results.append(result)
+        
+        coverage_time = time.time() - coverage_start_time
+        print(f"   ✅ Event coverage check completed in {coverage_time:.2f} seconds")
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error in event coverage analysis: {str(e)}")
+        return []
+
 def build_dynamic_schema(criteria):
     """Build dynamic BigQuery schema based on criteria configuration."""
     # Start with standard fields
@@ -721,30 +837,36 @@ Article content:
         # Escape triple quotes if they appear in the prompt (unlikely but safe)
         full_prompt_escaped = full_prompt.replace('"""', '\\"""')
         
-        # Get PMIDs from dataframe
-        pmids = df['PMID'].tolist()
-        pmids_str = "', '".join(pmids)
+        # Get PMCIDs from dataframe (using name field as primary identifier)
+        # Handle cases where PMCID might be None
+        pmcids = [str(pmcid) for pmcid in df['PMCID'].tolist() if pmcid is not None]
+        if not pmcids:
+            print("Warning: No valid PMCIDs found in batch for full analysis")
+            return []
+        pmcids_str = "', '".join(pmcids)
         
         # Format schema for single line
         schema_single_line = schema.replace('\n', ' ').replace('    ', '')
         
-        # Construct AI.GENERATE_TABLE query using triple quotes
+        # Construct AI.GENERATE_TABLE query using PMCID as primary identifier
         query = f'''
         SELECT 
+            name AS PMCID,
             PMID,
-            * EXCEPT (PMID, prompt, full_response, status)
+            * EXCEPT (name, PMID, prompt, full_response, status)
         FROM 
         AI.GENERATE_TABLE(
             MODEL `{PROJECT_ID}.{USER_DATASET}.gemini_generation`,
             (
                 SELECT 
+                    name AS PMCID,
                     PMID,
                     CONCAT(
                         """{full_prompt_escaped}""",
                         content
                     ) AS prompt
                 FROM `{PUBMED_TABLE}`
-                WHERE PMID IN ('{pmids_str}')
+                WHERE name IN ('{pmcids_str}')
             ),
             STRUCT(
                 """{schema_single_line}""" AS output_schema,
@@ -791,10 +913,13 @@ Article content:
                             print(f"Warning: Could not convert {criterion['name']} value '{field_value}' to int, defaulting to 0")
                             result_dict[criterion['name']] = 0
             
-            # Find the corresponding content from the original df
-            matching_row = df[df['PMID'] == result_dict.get('PMID')]
+            # Find the corresponding content from the original df using PMCID
+            matching_row = df[df['PMCID'] == result_dict.get('PMCID')]
             if not matching_row.empty:
                 result_dict['content'] = matching_row.iloc[0]['content']
+                # Keep PMID if available for PubMed links
+                if 'PMID' in matching_row.columns:
+                    result_dict['PMID'] = matching_row.iloc[0].get('PMID')
             results.append(result_dict)
         
         total_ai_time = time.time() - ai_start_time
@@ -1245,10 +1370,44 @@ def create_app(share=False):
                 analysis_status = gr.Markdown()
 
             with gr.TabItem("4. Results", id=4):
+                # Analysis configuration section
+                with gr.Column():
+                    gr.Markdown("### Analysis Configuration")
+                    with gr.Row():
+                        default_articles_input = gr.Number(
+                            label="Default Articles to Retrieve",
+                            value=5,
+                            minimum=1,
+                            maximum=50,
+                            step=1,
+                            info="Initial number of articles to retrieve from PubMed"
+                        )
+                        min_articles_per_event = gr.Number(
+                            label="Minimum Articles per Event",
+                            value=3,
+                            minimum=1,
+                            maximum=10,
+                            step=1,
+                            info="Minimum number of articles required for each actionable event"
+                        )
+                    start_analysis_btn = gr.Button("Start Analysis", variant="primary")
+                    
+                    # Configuration state
+                    analysis_config = gr.State({
+                        "default_articles": 5,
+                        "min_per_event": 3,
+                        "max_articles": 50
+                    })
+                
+                gr.Markdown("---")
+                
                 # Progress tracking components
                 with gr.Row():
-                    analysis_progress = gr.Markdown("Ready to analyze articles.")
+                    analysis_progress = gr.Markdown("Configure settings above and click 'Start Analysis' to begin.")
                     stop_analysis_btn = gr.Button("Stop Analysis", variant="stop", visible=False)
+                
+                # Event coverage display
+                event_coverage_display = gr.Markdown(visible=False)
                 
                 # Live results display - hidden as it's redundant
                 live_results_df = gr.DataFrame(
@@ -1823,53 +1982,172 @@ def create_app(share=False):
                 outputs=all_outputs
             )
         
-        # Generator function for progressive analysis
-        def run_analysis_generator(case_text, num_articles, persona, criteria, extraction_state):
-            """Generator that yields analysis progress updates."""
+        # Generator function for two-phase progressive analysis
+        def run_two_phase_analysis(case_text, analysis_config, persona, criteria, extraction_state):
+            """Generator that yields analysis progress updates with two-phase approach."""
             if not genai_client or not bq_client:
                 yield {"status": "error", "message": "❌ Please complete setup first."}
                 return
             
             try:
-                # Step 1: Use already extracted medical info
-                yield {"status": "starting", "message": "Starting analysis..."}
+                # Get configuration
+                default_articles = int(analysis_config.get("default_articles", 5))
+                min_per_event = int(analysis_config.get("min_per_event", 3))
+                max_articles = int(analysis_config.get("max_articles", 50))
                 
+                # Extract disease and events with IDs
                 disease = extraction_state.get('disease', '')
-                events = extraction_state.get('events', '')
-                events_list = [e.strip() for e in events.split(',') if e.strip()]
+                events_list = extraction_state.get('events_list', [])
+                events_with_ids = extraction_state.get('events_with_ids', {})
                 
-                # Step 2: Search PubMed
-                yield {"status": "searching", "message": f"Searching PubMed for articles about {disease}..."}
+                if not events_with_ids:
+                    # Fallback: generate IDs if not present
+                    events_text = extraction_state.get('events', '')
+                    if '"' in events_text:
+                        import re
+                        events_list = re.findall(r'"([^"]+)"', events_text)
+                    else:
+                        events_list = [e.strip() for e in events_text.split('\n') if e.strip()]
+                    
+                    events_with_ids = {f"event_{i}": event for i, event in enumerate(events_list, 1)}
+                    extraction_state['events_list'] = events_list
+                    extraction_state['events_with_ids'] = events_with_ids
+                
+                yield {"status": "starting", "message": "Starting two-phase analysis..."}
+                
+                # Phase 1: Event Coverage Check
+                yield {"status": "phase1_start", "message": "Phase 1: Checking event coverage..."}
+                
+                event_coverage = {event_id: [] for event_id in events_with_ids.keys()}
+                total_articles_searched = 0
+                selected_pmids = set()
+                all_searched_articles = []  # Keep all articles for potential full analysis
                 
                 embedding_model_path = f"{PROJECT_ID}.{USER_DATASET}.textembed"
-                articles_df = search_pubmed_articles(disease, events_list, bq_client, embedding_model_path, PUBMED_TABLE, num_articles)
                 
-                total_articles = len(articles_df)
-                yield {
-                    "status": "search_complete", 
-                    "message": f"Found {total_articles} articles. Starting analysis...",
-                    "total": total_articles
-                }
-                
-                # Step 3: Analyze articles one by one
-                analyzed_articles = []
-                
-                for idx, (_, article_row) in enumerate(articles_df.iterrows()):
+                while total_articles_searched < max_articles:
+                    # Check if all events have minimum coverage
+                    all_covered = all(len(pmids) >= min_per_event for pmids in event_coverage.values())
+                    if all_covered:
+                        break
+                    
+                    # Search next batch
+                    batch_start = total_articles_searched + 1
+                    batch_end = min(total_articles_searched + default_articles, max_articles)
+                    
                     yield {
-                        "status": "analyzing",
-                        "current": idx + 1,
-                        "total": total_articles,
-                        "message": f"Analyzing article {idx + 1} of {total_articles}..."
+                        "status": "phase1_searching",
+                        "message": f"Searching articles {batch_start}-{batch_end}...",
+                        "coverage": event_coverage
                     }
                     
-                    # Analyze single article
-                    try:
-                        article_start_time = time.time()
+                    # Fetch articles with offset
+                    articles_df = search_pubmed_articles(
+                        disease, events_list, bq_client, embedding_model_path, 
+                        PUBMED_TABLE, default_articles, offset=total_articles_searched
+                    )
+                    
+                    if articles_df.empty:
+                        break
+                    
+                    all_searched_articles.append(articles_df)
+                    
+                    # Analyze batch for event coverage
+                    yield {
+                        "status": "phase1_analyzing",
+                        "message": f"Analyzing batch for event coverage...",
+                        "coverage": event_coverage
+                    }
+                    
+                    coverage_results = analyze_event_coverage_batch(
+                        articles_df, disease, events_with_ids, bq_client
+                    )
+                    
+                    # Update coverage tracking using PMCID
+                    for result in coverage_results:
+                        pmcid = result['PMCID']
+                        event_ids_str = result.get('event_ids', '')
                         
-                        # Create a single-row DataFrame for this article
+                        if event_ids_str:
+                            event_ids = [e.strip() for e in event_ids_str.split(',') if e.strip()]
+                            for event_id in event_ids:
+                                if event_id in event_coverage:
+                                    if pmcid not in event_coverage[event_id]:
+                                        event_coverage[event_id].append(pmcid)
+                                    selected_pmids.add(pmcid)
+                    
+                    total_articles_searched += len(articles_df)
+                    
+                    # Report coverage status
+                    coverage_status = []
+                    for event_id, event_text in events_with_ids.items():
+                        count = len(event_coverage[event_id])
+                        status_text = f"{event_text[:30]}...: {count}/{min_per_event}"
+                        if count >= min_per_event:
+                            status_text = f"✓ {status_text}"
+                        coverage_status.append(status_text)
+                    
+                    yield {
+                        "status": "phase1_progress",
+                        "message": f"Searched {total_articles_searched} articles",
+                        "coverage": event_coverage,
+                        "coverage_status": coverage_status
+                    }
+                
+                # Phase 1 Complete
+                all_covered = all(len(pmids) >= min_per_event for pmids in event_coverage.values())
+                phase1_summary = f"Phase 1 complete: Searched {total_articles_searched} articles, found {len(selected_pmids)} relevant articles"
+                
+                if not all_covered:
+                    phase1_summary += " (Warning: Some events did not meet minimum coverage)"
+                
+                yield {
+                    "status": "phase1_complete",
+                    "message": phase1_summary,
+                    "selected_articles": len(selected_pmids),
+                    "coverage": event_coverage
+                }
+                
+                # Phase 2: Full Analysis - Analyze ALL articles
+                # Combine all searched articles
+                all_articles_df = pd.concat(all_searched_articles, ignore_index=True) if all_searched_articles else pd.DataFrame()
+                
+                if all_articles_df.empty:
+                    yield {
+                        "status": "complete",
+                        "message": "No articles found",
+                        "results": {
+                            'articles': [],
+                            'disease': disease,
+                            'events': events_list,
+                            'case_text': case_text,
+                            'persona': persona,
+                            'criteria': criteria
+                        }
+                    }
+                    return
+                
+                yield {"status": "phase2_start", "message": f"Phase 2: Performing full analysis on ALL {len(all_articles_df)} articles found..."}
+                
+                # Use all articles, not just selected ones
+                selected_articles_df = all_articles_df
+                
+                # Analyze selected articles one by one for UI updates
+                analyzed_articles = []
+                
+                for idx, (_, article_row) in enumerate(selected_articles_df.iterrows()):
+                    yield {
+                        "status": "phase2_analyzing",
+                        "current": idx + 1,
+                        "total": len(selected_articles_df),
+                        "message": f"Full analysis: article {idx + 1} of {len(selected_articles_df)}..."
+                    }
+                    
+                    try:
+                        # Create single-row DataFrame
                         single_article_df = pd.DataFrame([article_row])
                         
-                        # Analyze with custom criteria using BigQuery
+                        # Full analysis with all criteria
                         analysis_results = analyze_article_batch_with_criteria(
                             single_article_df, disease, events_list, bq_client, 
                             journal_impact_dict, persona, criteria
@@ -1883,28 +2161,21 @@ def create_app(share=False):
                             article_data.update(analysis)
                             
                             # Calculate score and get breakdown
-                            score_start_time = time.time()
                             score, point_breakdown = calculate_dynamic_score(analysis, criteria, journal_impact_dict)
-                            score_time = time.time() - score_start_time
-                            print(f"   🧮 Score calculation took {score_time:.2f} seconds")
                             
                             article_data['score'] = score
                             article_data['point_breakdown'] = point_breakdown
-                            
-                            # Ensure we have the full content
                             article_data['content'] = article_row.get('content', '')
-                            article_data['pmid'] = article_row.get('PMID', '')
+                            article_data['pmcid'] = article_row.get('PMCID', '')
+                            article_data['pmid'] = article_row.get('PMID', '')  # May be None
                             
                             analyzed_articles.append(article_data)
-                            
-                            article_total_time = time.time() - article_start_time
-                            print(f"   ⏱️  Total time for article {idx + 1}: {article_total_time:.2f} seconds\n")
                             
                             # Yield the analyzed article
                             yield {
                                 "status": "article_complete",
                                 "current": idx + 1,
-                                "total": total_articles,
+                                "total": len(selected_pmids),
                                 "article": {
                                     "score": score,
                                     "point_breakdown": point_breakdown,
@@ -1917,11 +2188,10 @@ def create_app(share=False):
                                 }
                             }
                         else:
-                            # Analysis failed for this article
                             yield {
                                 "status": "article_failed",
                                 "current": idx + 1,
-                                "total": total_articles,
+                                "total": len(selected_pmids),
                                 "message": f"Failed to analyze article {idx + 1}"
                             }
                             
@@ -1930,15 +2200,15 @@ def create_app(share=False):
                         yield {
                             "status": "article_failed",
                             "current": idx + 1,
-                            "total": total_articles,
+                            "total": len(selected_pmids),
                             "message": f"Error analyzing article {idx + 1}: {str(e)}"
                         }
                     
                     # Add a small delay to avoid rate limiting
-                    if idx < total_articles - 1:
+                    if idx < len(selected_pmids) - 1:
                         time.sleep(1)
                 
-                # Step 4: Final results
+                # Final results
                 yield {
                     "status": "complete",
                     "message": f"✅ Analysis complete! Analyzed {len(analyzed_articles)} articles.",
@@ -1948,7 +2218,9 @@ def create_app(share=False):
                         'events': events_list,
                         'case_text': case_text,
                         'persona': persona,
-                        'criteria': criteria
+                        'criteria': criteria,
+                        'total_searched': total_articles_searched,
+                        'event_coverage': event_coverage
                     }
                 }
                 
@@ -2031,12 +2303,10 @@ def create_app(share=False):
                 
                 <div style='margin: 10px 0;'>
                     <strong style='color: #212529;'>Links:</strong> 
-                    <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/" target="_blank" style="color: #0066cc; text-decoration: underline; margin-right: 15px;">
-                        🔗 PubMed (PMID: {article.get('pmid', 'N/A')})
+                    <a href="https://pmc.ncbi.nlm.nih.gov/articles/{article.get('pmcid', '')}/" target="_blank" style="color: #0066cc; text-decoration: underline; margin-right: 15px;">
+                        🔗 PMC Full Text (PMCID: {article.get('pmcid', 'N/A')})
                     </a>
-                    <a href="https://pubmed.ncbi.nlm.nih.gov/{article.get('pmid', '')}/?format=pubmed" target="_blank" style="color: #0066cc; text-decoration: underline;">
-                        📄 Full Text (if available)
-                    </a>
+                    {f'<a href="https://pubmed.ncbi.nlm.nih.gov/{article.get("pmid")}/" target="_blank" style="color: #0066cc; text-decoration: underline;">📄 PubMed (PMID: {article.get("pmid")})</a>' if article.get('pmid') else ''}
                 </div>
                 
                 <div style='margin: 10px 0;'>
@@ -2242,62 +2512,148 @@ def create_app(share=False):
             
             return [current_results, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), is_active]
         
-        # Function to handle the analysis button click
-        def start_analysis(case_text, num_articles, persona, criteria, extraction_state):
-            """Start the analysis and switch to results tab."""
-            if not extraction_state.get("extracted", False):
-                return (
-                    gr.update(value="❌ Please extract disease and events first."),
-                    gr.update(),
-                    gr.update()
-                )
-            
-            return (
-                gr.update(value=""),  # Clear status
-                gr.update(selected=4),  # Switch to results tab
-                gr.update()  # Update other components as needed
-            )
+        # New functions to handle configuration updates
+        def update_analysis_config(default_articles, min_per_event):
+            """Update the analysis configuration state."""
+            return {
+                "default_articles": int(default_articles),
+                "min_per_event": int(min_per_event),
+                "max_articles": 50
+            }
         
-        # Function to run the analysis with proper generator handling
-        def run_full_analysis(case_text, num_articles, persona, criteria, extraction_state):
-            """Run the full analysis with progressive updates."""
+        # Connect configuration inputs to state
+        default_articles_input.change(
+            update_analysis_config,
+            inputs=[default_articles_input, min_articles_per_event],
+            outputs=[analysis_config]
+        )
+        
+        min_articles_per_event.change(
+            update_analysis_config,
+            inputs=[default_articles_input, min_articles_per_event],
+            outputs=[analysis_config]
+        )
+        
+        # Function to run the two-phase analysis with proper generator handling
+        def run_full_analysis_two_phase(case_text, analysis_config, persona, criteria, extraction_state):
+            """Run the two-phase analysis with progressive updates."""
             # Initialize states
             results = []
             is_active = True
             
-            # Create the generator
-            generator = run_analysis_generator(case_text, num_articles, persona, criteria, extraction_state)
+            # Create the generator for two-phase analysis
+            generator = run_two_phase_analysis(case_text, analysis_config, persona, criteria, extraction_state)
             
             # Process each yield from the generator
             for progress_data in generator:
                 if not is_active:  # Check if analysis was stopped
                     break
                     
-                # Update the display
-                results, progress_update, df_update, html_update, summary_update, stop_btn_update, is_active = update_analysis_display(
-                    progress_data, results, is_active
-                )
+                # Update the display based on status
+                status = progress_data.get("status", "")
                 
-                # Yield the updates to Gradio
-                yield [
-                    results,  # results_state
-                    progress_update,  # analysis_progress
-                    df_update,  # live_results_df
-                    html_update,  # detailed_analysis_html
-                    summary_update,  # analysis_summary
-                    stop_btn_update,  # stop_analysis_btn
-                    is_active  # analysis_active
-                ]
+                # Handle phase 1 specific statuses
+                if status in ["phase1_start", "phase1_searching", "phase1_analyzing", "phase1_progress", "phase1_complete"]:
+                    if status == "phase1_progress":
+                        # Format coverage status for display
+                        coverage_status = progress_data.get("coverage_status", [])
+                        coverage_html = "<br>".join(coverage_status)
+                        yield [
+                            results,
+                            gr.update(value=f"{progress_data.get('message', '')}"),
+                            gr.update(visible=True, value=coverage_html),
+                            gr.update(),
+                            gr.update(),
+                            gr.update(),
+                            gr.update(visible=True),
+                            is_active
+                        ]
+                    else:
+                        yield [
+                            results,
+                            gr.update(value=progress_data.get("message", "")),
+                            gr.update(visible=True),
+                            gr.update(),
+                            gr.update(),
+                            gr.update(),
+                            gr.update(visible=True),
+                            is_active
+                        ]
+                elif status == "phase2_start":
+                    yield [
+                        results,
+                        gr.update(value=progress_data.get("message", "")),
+                        gr.update(visible=False),  # Hide coverage display for phase 2
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(visible=True),
+                        is_active
+                    ]
+                elif status == "phase2_analyzing":
+                    current = progress_data.get("current", 0)
+                    total = progress_data.get("total", 0)
+                    progress_pct = (current / total * 100) if total > 0 else 0
+                    yield [
+                        results,
+                        gr.update(value=f"Phase 2: Analyzing article {current}/{total} ({progress_pct:.0f}%)"),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        is_active
+                    ]
+                else:
+                    # Use the regular update display for other statuses
+                    results, progress_update, df_update, html_update, summary_update, stop_btn_update, is_active = update_analysis_display(
+                        progress_data, results, is_active
+                    )
+                    
+                    # Add event coverage display update
+                    yield [
+                        results,
+                        progress_update,
+                        gr.update(),  # event_coverage_display
+                        df_update,
+                        html_update,
+                        summary_update,
+                        stop_btn_update,
+                        is_active
+                    ]
         
-        # Click handler for analyze button
+        # Original analyze button (from Persona tab) just switches to Results tab
         analyze_btn.click(
-            start_analysis,
-            inputs=[case_input, num_articles_slider, persona_text, criteria_state, extraction_state],
-            outputs=[analysis_status, tabs, live_results_df]
+            lambda: gr.update(selected=4),  # Switch to Results tab
+            outputs=[tabs]
+        )
+        
+        # Handler for Start Analysis button in Results tab (two-phase analysis)
+        def start_two_phase_analysis(case_text, analysis_config, persona, criteria, extraction_state):
+            """Start the two-phase analysis."""
+            if not extraction_state.get("extracted", False):
+                return (
+                    gr.update(value="❌ Please extract disease and events first."),
+                    gr.update(),
+                    gr.update(),
+                    gr.update()
+                )
+            
+            return (
+                gr.update(value="🔄 Starting two-phase analysis..."),  # analysis_progress
+                gr.update(visible=True),  # stop_analysis_btn
+                gr.update(visible=True, value=""),  # event_coverage_display
+                gr.update()  # other updates
+            )
+        
+        start_analysis_btn.click(
+            start_two_phase_analysis,
+            inputs=[case_input, analysis_config, persona_text, criteria_state, extraction_state],
+            outputs=[analysis_progress, stop_analysis_btn, event_coverage_display, live_results_df]
         ).then(
-            run_full_analysis,
-            inputs=[case_input, num_articles_slider, persona_text, criteria_state, extraction_state],
-            outputs=[results_state, analysis_progress, live_results_df, detailed_analysis_html, analysis_summary, stop_analysis_btn, analysis_active]
+            run_full_analysis_two_phase,
+            inputs=[case_input, analysis_config, persona_text, criteria_state, extraction_state],
+            outputs=[results_state, analysis_progress, event_coverage_display, live_results_df, detailed_analysis_html, analysis_summary, stop_analysis_btn, analysis_active]
         )
         
         # Stop button handler

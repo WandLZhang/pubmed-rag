@@ -26,15 +26,14 @@ import argparse
 # --- Constants ---
 PUBMED_DATASET = "wz-data-catalog-demo.pubmed"
 PUBMED_TABLE = f"{PUBMED_DATASET}.pmid_embed_nonzero_metadata"
-MODEL_ID = "gemini-2.5-flash-lite"  # Default model, will be updated dynamically
+MODEL_ID = "gemini-2.5-flash"  # Default model, will be updated dynamically
 THINKING_BUDGET = 0  # Default thinking budget, will be updated dynamically
 JOURNAL_IMPACT_CSV_URL = "https://raw.githubusercontent.com/WandLZhang/scimagojr_2024/main/scimagojr_2024.csv"
 REQUIRED_APIS = ["aiplatform.googleapis.com", "bigquery.googleapis.com", "cloudresourcemanager.googleapis.com"]
 CREATE_BILLING_ACCOUNT_URL = "https://console.cloud.google.com/billing/create?inv=1&invt=Ab4E_Q"
 CREATE_BILLING_ACCOUNT_OPTION = "→ Create New Billing Account"
 MODEL_OPTIONS = {
-    "Gemini 2.5 Flash Lite (Default)": "gemini-2.5-flash-lite",
-    "Gemini 2.5 Flash": "gemini-2.5-flash", 
+    "Gemini 2.5 Flash (Default)": "gemini-2.5-flash", 
     "Gemini 2.5 Pro": "gemini-2.5-pro"
 }
 SAMPLE_CASE = """A now almost 4-year-old female diagnosed with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO DBH AML 2012 protocol. Post- MEC and ADE, MRD remained at 35% and 53%. Vyxeos-clofarabine therapy reduced MRD to 18%. Third-line FLAG-Mylotarg lowered MRD to 3.5% (flow) and 1% (molecular). After a cord blood HSCT in December 2022, she relapsed 10 months later with 3% MRD and femoral extramedullary disease.
@@ -71,20 +70,29 @@ Output only the disease name. No additional text or formatting.
 """
 
 # Events extraction prompt from gemini-medical-literature
-EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify actionable events for treatment decisions.
+EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify the 5 MOST SERIOUS events that are critical for treatment decisions and prognosis.
 
-Task: Extract clinically relevant events including:
-- Genetic mutations/fusions (e.g., "KMT2A::MLLT3 fusion", "NRAS mutation")
-- Positive markers (e.g., "CD33", "CD123")
-- Disease status (e.g., "relapsed after HSCT", "refractory")
-- Specific therapies (e.g., "revumenib", "FLAG-Mylotarg")
-- Treatment responses (e.g., "MRD reduction to 0.1%")
+Task: Identify and rank ALL clinically relevant events by severity, then output ONLY the TOP 5 most serious events.
+
+Severity Ranking (from most to least serious):
+1. Treatment failures and relapses (e.g., "relapsed after HSCT", "refractory to multiple lines")
+2. Life-threatening complications (e.g., "CNS involvement", "extramedullary disease")
+3. High-risk genetic alterations (e.g., "KMT2A rearrangement", "TP53 mutation")
+4. Poor treatment responses (e.g., "MRD 35% after induction", "no response to therapy")
+5. Critical biomarkers affecting prognosis (e.g., "FLT3-ITD positive", "complex karyotype")
+
+Instructions:
+- First identify ALL events in the case
+- Then select EXACTLY 5 most serious events based on the severity ranking
+- Prioritize events that indicate poor prognosis or treatment challenges
+- Include specific values/percentages when available (e.g., "MRD 33%")
 
 Example:
-Input: "A 4-year-old female with KMT2A-rearranged AML...WES showed KMT2A::MLLT3 fusion and NRAS (p.Gln61Lys) mutation. Flow cytometry showed positive CD33 and CD123..."
-Output: "KMT2A::MLLT3 fusion" "NRAS" "CD33" "CD123"
+Input: "A 4-year-old female with KMT2A-rearranged AML and CNS2 involvement exhibited refractory disease after NOPHO protocol. MRD remained at 35%. She relapsed 10 months after cord blood HSCT with 33% blasts. WES showed KMT2A::MLLT3 fusion and NRAS mutation. Flow showed CD33 and CD123 positive."
 
-Output only the list of actionable events. No additional text or formatting.
+Output: "relapsed after HSCT with 33% blasts" "refractory disease after NOPHO protocol" "KMT2A::MLLT3 fusion" "CNS2 involvement" "MRD 35% after induction"
+
+Output only the 5 most serious events, one per line in quotes. No additional text or formatting.
 """
 
 # --- Helper Functions for Enhanced Setup ---
@@ -362,9 +370,6 @@ def load_journal_data():
                 if len(nan_examples) < 3:
                     nan_examples.append(f"  - '{title}': SJR={sjr_str} (conversion error)")
         
-        if nan_examples:
-            for example in nan_examples:
-                print(example)
         
         return sjr_dict
     except Exception as e:
@@ -505,13 +510,15 @@ def calculate_dynamic_score(metadata, criteria_list, journal_dict):
             sjr = lookup_journal_impact_score(journal_title, journal_dict, genai_client)
             
             if sjr > 0:
-                # Apply user's weight directly as a percentage
-                weighted_score = sjr * (criterion['weight'] / 100)
+                # Apply logarithmic scaling with a cap to prevent domination
+                # Log scale: log(sjr + 1) * 10, capped at 100
+                normalized_sjr = min(math.log(sjr + 1) * 10, 100)
+                weighted_score = normalized_sjr * (criterion['weight'] / 100)
                 score += weighted_score
                 breakdown['journal_impact'] = round(weighted_score, 2)
                 
         elif criterion_type == 'special_year':
-            # Year penalty: -5 points per year from current
+            # Enhanced year penalty with exponential decay
             year_value = metadata.get('year')
             if year_value is not None and year_value != '':
                 try:
@@ -523,7 +530,9 @@ def calculate_dynamic_score(metadata, criteria_list, journal_dict):
                     
                     if article_year > 1900 and article_year <= current_year:  # Sanity check
                         year_diff = current_year - article_year
-                        year_penalty = -5 * year_diff
+                        # Exponential decay: penalty grows exponentially with age
+                        # Base penalty of -10, multiplied by 1.2^year_diff
+                        year_penalty = -10 * (1.2 ** min(year_diff, 10))  # Cap at 10 years to prevent overflow
                         # Apply user's weight as a multiplier
                         weighted_penalty = year_penalty * criterion['weight'] / 100  # Normalize weight
                         score += weighted_penalty
@@ -897,7 +906,7 @@ def create_app(share=False):
                         model_dropdown = gr.Dropdown(
                             label="Select Model",
                             choices=list(MODEL_OPTIONS.keys()),
-                            value="Gemini 2.5 Flash Lite (Default)",
+                            value="Gemini 2.5 Flash (Default)",
                             interactive=True,
                             info="Choose the Gemini model to use for analysis"
                         )
@@ -960,7 +969,33 @@ def create_app(share=False):
                     
                     # Extraction results box
                     with gr.Column(visible=False) as extraction_box:
-                        extraction_display = gr.Markdown("")
+                        gr.Markdown("### Extracted Information")
+                        gr.Markdown("*You can edit the extracted values below before proceeding with the analysis.*")
+                        
+                        # Editable fields
+                        with gr.Row():
+                            disease_edit = gr.Textbox(
+                                label="Disease",
+                                value="",
+                                lines=1,
+                                interactive=True,
+                                elem_id="disease_edit"
+                            )
+                            reset_disease_btn = gr.Button("Reset", size="sm", scale=0)
+                        
+                        events_edit = gr.Textbox(
+                            label="Actionable Events",
+                            value="",
+                            lines=3,
+                            interactive=True,
+                            elem_id="events_edit",
+                            info="One event per line or comma-separated"
+                        )
+                        reset_events_btn = gr.Button("Reset to AI suggestion", size="sm")
+                        
+                        # Original AI extraction display (for reference)
+                        with gr.Accordion("View Original AI Extraction", open=False):
+                            ai_extraction_display = gr.Markdown("")
                     
                     # Store extraction state
                     extraction_state = gr.State({"extracted": False, "disease": "", "events": ""})
@@ -1295,8 +1330,10 @@ def create_app(share=False):
             if not case_text.strip():
                 return (
                     gr.update(visible=False),  # extraction_box
-                    "",  # extraction_display
-                    {"extracted": False, "disease": "", "events": ""},  # extraction_state
+                    "",  # disease_edit
+                    "",  # events_edit
+                    "",  # ai_extraction_display
+                    {"extracted": False, "disease": "", "events": "", "ai_disease": "", "ai_events": ""},  # extraction_state
                     gr.update(interactive=False),  # proceed_button
                     "❌ Please enter case notes first.",  # case_status
                     gr.update(visible=False),  # extraction_loading
@@ -1306,8 +1343,10 @@ def create_app(share=False):
             if not genai_client:
                 return (
                     gr.update(visible=True),
-                    "❌ Please complete setup first.",
-                    {"extracted": False, "disease": "", "events": ""},
+                    "",  # disease_edit
+                    "",  # events_edit
+                    "❌ Please complete setup first.",  # ai_extraction_display
+                    {"extracted": False, "disease": "", "events": "", "ai_disease": "", "ai_events": ""},
                     gr.update(interactive=False),
                     "",
                     gr.update(visible=False),  # extraction_loading
@@ -1320,20 +1359,22 @@ def create_app(share=False):
                 disease = medical_info.get('disease', '')
                 events = medical_info.get('events', '')
                 
-                # Format display with raw Gemini output
-                display_text = f"""<div class="extraction-result">
-<strong>Disease:</strong> {disease}
+                # Format display for AI extraction reference
+                ai_display_text = f"""<div class="extraction-result">
+<strong>AI Extracted Disease:</strong> {disease}
 
-<strong>Actionable Events:</strong>
+<strong>AI Extracted Events:</strong>
 {events}
 </div>"""
                 
                 return (
                     gr.update(visible=True),  # extraction_box
-                    display_text,  # extraction_display
-                    {"extracted": True, "disease": disease, "events": events},  # extraction_state
+                    disease,  # disease_edit - populate with AI extraction
+                    events,  # events_edit - populate with AI extraction
+                    ai_display_text,  # ai_extraction_display
+                    {"extracted": True, "disease": disease, "events": events, "ai_disease": disease, "ai_events": events},  # extraction_state
                     gr.update(interactive=True),  # proceed_button
-                    "✅ Information extracted successfully.",  # case_status
+                    "✅ Information extracted successfully. You can edit the values before proceeding.",  # case_status
                     gr.update(visible=False),  # extraction_loading
                     gr.update(interactive=True)  # extract_btn
                 )
@@ -1341,8 +1382,10 @@ def create_app(share=False):
             except Exception as e:
                 return (
                     gr.update(visible=True),
-                    f"❌ Error extracting information: {str(e)}",
-                    {"extracted": False, "disease": "", "events": ""},
+                    "",  # disease_edit
+                    "",  # events_edit
+                    f"❌ Error extracting information: {str(e)}",  # ai_extraction_display
+                    {"extracted": False, "disease": "", "events": "", "ai_disease": "", "ai_events": ""},
                     gr.update(interactive=False),
                     "",
                     gr.update(visible=False),  # extraction_loading
@@ -1356,7 +1399,7 @@ def create_app(share=False):
         ).then(
             extract_and_display,
             inputs=[case_input, disease_prompt_input, events_prompt_input],
-            outputs=[extraction_box, extraction_display, extraction_state, proceed_to_persona_btn, case_status, extraction_loading, extract_btn]
+            outputs=[extraction_box, disease_edit, events_edit, ai_extraction_display, extraction_state, proceed_to_persona_btn, case_status, extraction_loading, extract_btn]
         )
         
         # Enable/disable extract button based on case input
@@ -1384,6 +1427,56 @@ def create_app(share=False):
         load_example_btn.click(
             load_example_case,
             outputs=[case_input, disease_prompt_input, events_prompt_input]
+        )
+        
+        # Event handlers for editable fields
+        def update_disease(new_disease, extraction_state):
+            """Update the disease value in extraction state when user edits it."""
+            if extraction_state:
+                extraction_state["disease"] = new_disease
+            return extraction_state
+        
+        def update_events(new_events, extraction_state):
+            """Update the events value in extraction state when user edits it."""
+            if extraction_state:
+                extraction_state["events"] = new_events
+            return extraction_state
+        
+        def reset_disease(extraction_state):
+            """Reset disease to the original AI extraction."""
+            if extraction_state and "ai_disease" in extraction_state:
+                return extraction_state["ai_disease"], extraction_state
+            return "", extraction_state
+        
+        def reset_events(extraction_state):
+            """Reset events to the original AI extraction."""
+            if extraction_state and "ai_events" in extraction_state:
+                return extraction_state["ai_events"], extraction_state
+            return "", extraction_state
+        
+        # Connect the handlers
+        disease_edit.change(
+            update_disease,
+            inputs=[disease_edit, extraction_state],
+            outputs=[extraction_state]
+        )
+        
+        events_edit.change(
+            update_events,
+            inputs=[events_edit, extraction_state],
+            outputs=[extraction_state]
+        )
+        
+        reset_disease_btn.click(
+            reset_disease,
+            inputs=[extraction_state],
+            outputs=[disease_edit, extraction_state]
+        )
+        
+        reset_events_btn.click(
+            reset_events,
+            inputs=[extraction_state],
+            outputs=[events_edit, extraction_state]
         )
 
         # Modified proceed button handler to go to Persona tab
@@ -1415,17 +1508,17 @@ def create_app(share=False):
         
         # Default criteria configuration
         DEFAULT_CRITERIA = [
-            {"name": "disease_match", "description": "Does the article match the patient's disease?", "weight": 50, "type": "boolean", "deletable": True},
+            {"name": "disease_match", "description": "Does the article match the patient's disease?", "weight": 80, "type": "boolean", "deletable": True},
             {"name": "treatment_shown", "description": "Does the article show positive treatment results?", "weight": 50, "type": "boolean", "deletable": True},
             {"name": "pediatric_focus", "description": "Does the article focus on pediatric patients?", "weight": 60, "type": "boolean", "deletable": True},
             {"name": "clinical_trial", "description": "Is this a clinical trial?", "weight": 70, "type": "boolean", "deletable": True},
             {"name": "novelty", "description": "Does the article present novel findings?", "weight": 65, "type": "boolean", "deletable": True},
-            {"name": "actionable_events_match", "description": "How many actionable events from the patient's case are mentioned in this article?", "weight": 85, "type": "direct", "deletable": True},
+            {"name": "actionable_events_match", "description": "How many actionable events from the patient's case are mentioned in this article?", "weight": 100, "type": "numeric", "deletable": True},
             {"name": "human_clinical_data", "description": "Does the article include human clinical data?", "weight": 30, "type": "boolean", "deletable": True},
             {"name": "cell_studies", "description": "Does the article include cell studies?", "weight": 5, "type": "boolean", "deletable": True},
             {"name": "mice_studies", "description": "Does the article include mice studies?", "weight": 10, "type": "boolean", "deletable": True},
-            {"name": "journal_impact", "description": "Journal impact factor (SJR)", "weight": 25, "type": "special_journal", "deletable": True},
-            {"name": "year", "description": "Publication year penalty", "weight": 20, "type": "special_year", "deletable": True}
+            {"name": "journal_impact", "description": "Journal impact factor (SJR)", "weight": 10, "type": "special_journal", "deletable": True},
+            {"name": "year", "description": "Publication year penalty", "weight": 30, "type": "special_year", "deletable": True}
         ]
         
         def calculate_total_weight(criteria_list):

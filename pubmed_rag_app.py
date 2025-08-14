@@ -9,8 +9,6 @@ import pandas as pd
 import json
 import math
 from datetime import datetime
-import plotly.express as px
-import plotly.graph_objects as go
 from google import genai
 from google.genai import types
 from google.cloud import bigquery
@@ -543,15 +541,6 @@ def search_pubmed_articles(disease, events, bq_client, embedding_model, pubmed_t
     
     return bq_client.query(sql).to_dataframe()
 
-def normalize_journal_score(sjr):
-    """Normalize journal SJR score using logarithmic scale (from gemini-medical-literature)."""
-    if not sjr or sjr <= 0:
-        return 0
-    # Use log scale to handle large range of SJR values
-    normalized = math.log(sjr + 1) * 5
-    # Cap at 25 points
-    return min(normalized, 25)
-
 def lookup_journal_impact_score(journal_title, journal_dict, genai_client):
     """Look up journal impact score using Gemini API with structured response."""
     if not journal_title or not genai_client:
@@ -691,20 +680,6 @@ def analyze_event_coverage_batch(df, disease, events_with_ids, bq_client):
         event_list_text = "\n".join([f"- {event_id}: \"{event_text}\"" 
                                      for event_id, event_text in events_with_ids.items()])
         
-        # Simple prompt focused only on event detection
-        coverage_prompt = f"""You are analyzing medical literature to identify which events from a patient case are mentioned in each article.
-
-Master events from patient case:
-{event_list_text}
-
-For this article, identify which events are mentioned or discussed. Return ONLY the event IDs (e.g., "event_1,event_3") for events that are clearly present in the article. If no events are found, return an empty string.
-
-Article content:
-"""
-        
-        # Escape triple quotes if needed
-        coverage_prompt_escaped = coverage_prompt.replace('"""', '\\"""')
-        
         # Get PMCIDs from dataframe (using name field as primary identifier)
         # Handle cases where PMCID might be None
         pmcids = [str(pmcid) for pmcid in df['PMCID'].tolist() if pmcid is not None]
@@ -713,7 +688,28 @@ Article content:
             return []
         pmcids_str = "', '".join(pmcids)
         
-        # Simple schema for event coverage
+        # Build PMCID to name mapping for prompt
+        pmcid_mapping = {}
+        for _, row in df.iterrows():
+            pmcid_mapping[str(row['PMCID'])] = str(row['PMCID'])
+        
+        # Simple prompt focused only on event detection
+        coverage_prompt = f"""You are analyzing medical literature to identify which events from a patient case are mentioned in each article.
+
+Master events from patient case:
+{event_list_text}
+
+IMPORTANT: You must return JSON with one field:
+- event_ids: Comma-separated event IDs found (e.g., "event_1,event_3"), or empty string if no events found
+
+Article PMCID: {{PMCID}}
+Article content:
+"""
+        
+        # Escape triple quotes if needed
+        coverage_prompt_escaped = coverage_prompt.replace('"""', '\\"""')
+        
+        # Schema only includes event_ids (name will be passed through automatically)
         schema = "event_ids STRING"
         
         # Construct AI.GENERATE_TABLE query for batch processing using PMCID
@@ -726,9 +722,9 @@ Article content:
             MODEL `{PROJECT_ID}.{USER_DATASET}.gemini_generation`,
             (
                 SELECT 
-                    name AS PMCID,
+                    name,
                     CONCAT(
-                        """{coverage_prompt_escaped}""",
+                        REPLACE("""{coverage_prompt_escaped}""", '{{PMCID}}', name),
                         content
                     ) AS prompt
                 FROM `{PUBMED_TABLE}`
@@ -851,9 +847,9 @@ Article content:
         # Construct AI.GENERATE_TABLE query using PMCID as primary identifier
         query = f'''
         SELECT 
-            name AS PMCID,
+            PMCID,
             PMID,
-            * EXCEPT (name, PMID, prompt, full_response, status)
+            * EXCEPT (PMCID, PMID, prompt, full_response, status)
         FROM 
         AI.GENERATE_TABLE(
             MODEL `{PROJECT_ID}.{USER_DATASET}.gemini_generation`,
@@ -2175,7 +2171,7 @@ def create_app(share=False):
                             yield {
                                 "status": "article_complete",
                                 "current": idx + 1,
-                                "total": len(selected_pmids),
+                                "total": len(selected_articles_df),
                                 "article": {
                                     "score": score,
                                     "point_breakdown": point_breakdown,
@@ -2183,6 +2179,7 @@ def create_app(share=False):
                                     "journal": analysis.get('journal_title', 'Unknown Journal'),
                                     "year": analysis.get('year', 'N/A'),
                                     "pmid": article_row.get('PMID', ''),
+                                    "pmcid": article_row.get('PMCID', ''),
                                     "content": article_row.get('content', ''),
                                     "metadata": analysis
                                 }
@@ -2191,7 +2188,7 @@ def create_app(share=False):
                             yield {
                                 "status": "article_failed",
                                 "current": idx + 1,
-                                "total": len(selected_pmids),
+                                "total": len(selected_articles_df),
                                 "message": f"Failed to analyze article {idx + 1}"
                             }
                             
@@ -2200,12 +2197,12 @@ def create_app(share=False):
                         yield {
                             "status": "article_failed",
                             "current": idx + 1,
-                            "total": len(selected_pmids),
+                            "total": len(selected_articles_df),
                             "message": f"Error analyzing article {idx + 1}: {str(e)}"
                         }
                     
                     # Add a small delay to avoid rate limiting
-                    if idx < len(selected_pmids) - 1:
+                    if idx < len(selected_articles_df) - 1:
                         time.sleep(1)
                 
                 # Final results

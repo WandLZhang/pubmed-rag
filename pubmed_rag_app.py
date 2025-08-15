@@ -1304,26 +1304,29 @@ def create_app(share=False):
         color: #212529 !important;  /* Black text for readability */
     }
     .final-analysis-display {
-        background-color: #ffffff;
+        background-color: #ffffff !important;
         border: 1px solid #dee2e6;
         border-radius: 8px;
         padding: 30px;
         margin: 20px 0;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         line-height: 1.8;
-        color: #212529;
+        color: #212529 !important;
         max-height: 800px;
         overflow-y: auto;
     }
+    .final-analysis-display * {
+        color: #212529 !important;
+    }
     .final-analysis-display h2 {
-        color: #0066cc;
+        color: #0066cc !important;
         border-bottom: 2px solid #0066cc;
         padding-bottom: 10px;
         margin-top: 30px;
         margin-bottom: 20px;
     }
     .final-analysis-display h3 {
-        color: #333;
+        color: #333 !important;
         margin-top: 25px;
         margin-bottom: 15px;
     }
@@ -1331,24 +1334,31 @@ def create_app(share=False):
         width: 100%;
         border-collapse: collapse;
         margin: 20px 0;
-        background-color: #fff;
+        background-color: #fff !important;
         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
     .final-analysis-display th {
-        background-color: #f8f9fa;
+        background-color: #f8f9fa !important;
         border: 1px solid #dee2e6;
         padding: 12px;
         text-align: left;
         font-weight: bold;
-        color: #495057;
+        color: #212529 !important;
     }
     .final-analysis-display td {
         border: 1px solid #dee2e6;
-        padding: 10px;
+        padding: 12px;
         vertical-align: top;
+        color: #212529 !important;
+        word-wrap: break-word;
+        word-break: break-word;
+        max-width: 300px;
+    }
+    .final-analysis-display td * {
+        color: #212529 !important;
     }
     .final-analysis-display a {
-        color: #0066cc;
+        color: #0066cc !important;
         text-decoration: none;
     }
     .final-analysis-display a:hover {
@@ -1357,9 +1367,17 @@ def create_app(share=False):
     .final-analysis-display ul, .final-analysis-display ol {
         margin: 10px 0;
         padding-left: 30px;
+        color: #212529 !important;
     }
     .final-analysis-display li {
         margin: 5px 0;
+        color: #212529 !important;
+    }
+    .final-analysis-display p {
+        color: #212529 !important;
+    }
+    .final-analysis-display span {
+        color: #212529 !important;
     }
     """
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="sky"), css=css) as demo:
@@ -1716,6 +1734,25 @@ def create_app(share=False):
                         value=[],
                         elem_id="article_selections"
                     )
+                
+                gr.Markdown("---")
+                
+                # Analysis Prompt Section
+                with gr.Column():
+                    with gr.Accordion("📝 Customize Analysis Prompt", open=False):
+                        gr.Markdown("*Edit the prompt template below to customize how the final analysis is generated. Use the placeholders `{case_description}`, `{primary_focus}`, `{key_concepts}`, and `{articles_content}` to include dynamic content.*")
+                        
+                        analysis_prompt_input = gr.Textbox(
+                            label="Analysis Prompt Template",
+                            value=FINAL_ANALYSIS_PROMPT_TEMPLATE,
+                            lines=20,
+                            placeholder="Enter your custom analysis prompt template...",
+                            elem_id="analysis_prompt_input"
+                        )
+                        
+                        with gr.Row():
+                            reset_prompt_btn = gr.Button("Reset to Default", size="sm")
+                            load_example_prompt_btn = gr.Button("Load Example", size="sm")
                     
                     # Generate button
                     generate_final_btn = gr.Button(
@@ -1736,6 +1773,43 @@ def create_app(share=False):
                 
                 # State to track selected articles
                 selected_articles_state = gr.State([])
+                
+                # Example prompts state
+                example_prompts = gr.State({
+                    "Clinical Focus": """You are a clinical researcher synthesizing findings for medical practice.
+
+CASE: {case_description}
+DISEASE: {primary_focus}
+KEY FACTORS: {key_concepts}
+
+ANALYZED ARTICLES:
+{articles_content}
+
+Please provide a clinical synthesis with these sections:
+
+## Clinical Summary: {primary_focus}
+
+### Key Clinical Findings
+- Summarize the most clinically relevant findings
+- Focus on treatment efficacy and safety
+- Highlight patient outcomes
+
+### Treatment Recommendations
+| Treatment | Evidence Level | Success Rate | Side Effects |
+|-----------|---------------|--------------|--------------|
+[Analyze treatments from the articles]
+
+### Clinical Pearls
+- List key takeaways for clinicians
+- Include dosing considerations
+- Note any contraindications
+
+### Future Directions
+- Identify gaps in clinical knowledge
+- Suggest areas for clinical trials
+""",
+                    "Research Focus": FINAL_ANALYSIS_PROMPT_TEMPLATE  # Default template
+                })
 
         # --- Event Handlers for UI ---
         def initialize_credentials_and_proceed():
@@ -3095,10 +3169,113 @@ def create_app(share=False):
             outputs=[article_selections]
         )
         
-        # Generate final analysis
+        # Prompt editing handlers
+        def reset_analysis_prompt():
+            """Reset the analysis prompt to default."""
+            return gr.update(value=FINAL_ANALYSIS_PROMPT_TEMPLATE)
+        
+        def load_example_analysis_prompt(example_prompts):
+            """Load a random example prompt."""
+            import random
+            prompt_name = random.choice(list(example_prompts.keys()))
+            return gr.update(value=example_prompts[prompt_name])
+        
+        reset_prompt_btn.click(
+            reset_analysis_prompt,
+            outputs=[analysis_prompt_input]
+        )
+        
+        load_example_prompt_btn.click(
+            load_example_analysis_prompt,
+            inputs=[example_prompts],
+            outputs=[analysis_prompt_input]
+        )
+        
+        # Modified generate_final_analysis to use custom prompt
+        def generate_final_analysis_with_custom_prompt(case_text, extraction_state, selected_articles, custom_prompt):
+            """Generate the final analysis with custom prompt and streaming."""
+            if not selected_articles:
+                yield gr.update(value="❌ Please select at least one article.")
+                return
+            
+            # Extract disease and events
+            disease = extraction_state.get('disease', '')
+            events = extraction_state.get('events_list', [])
+            
+            # Create custom prompt by filling in the template
+            sorted_articles = sorted(selected_articles, key=lambda x: x.get('score', 0), reverse=True)
+            
+            # Format all selected articles
+            articles_content_parts = []
+            for idx, article in enumerate(sorted_articles, 1):
+                articles_content_parts.append(format_article_for_analysis(article, idx))
+            
+            # Join all articles with separator
+            articles_content = ("\n" + "="*80 + "\n").join(articles_content_parts)
+            
+            # Fill in the custom template
+            try:
+                filled_prompt = custom_prompt.format(
+                    case_description=case_text,
+                    primary_focus=disease,
+                    key_concepts=', '.join(events),
+                    articles_content=articles_content
+                )
+            except KeyError as e:
+                yield gr.update(value=f"❌ Error in prompt template: Missing placeholder {{{e}}}. Please check your prompt template.")
+                return
+            
+            # Stream the analysis
+            yield gr.update(value="🔄 Generating comprehensive analysis...")
+            
+            # Use the existing streaming logic but with custom prompt
+            if not genai_client:
+                yield gr.update(value="❌ Gemini client not initialized. Please complete setup first.")
+                return
+            
+            try:
+                # Generate content with streaming
+                config = GenerateContentConfig(
+                    temperature=0.3,
+                    max_output_tokens=8192,
+                    candidate_count=1,
+                    thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
+                )
+                
+                # Stream the response
+                try:
+                    response_stream = genai_client.models.generate_content_stream(
+                        model=MODEL_ID,
+                        contents=[filled_prompt],
+                        config=config
+                    )
+                    
+                    accumulated_text = ""
+                    
+                    for chunk in response_stream:
+                        if hasattr(chunk, 'candidates') and chunk.candidates:
+                            for candidate in chunk.candidates:
+                                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                                    for part in candidate.content.parts:
+                                        if hasattr(part, 'text'):
+                                            accumulated_text += part.text
+                                            # Yield the accumulated content so far
+                                            yield gr.update(value=accumulated_text)
+                    
+                    # If no content was generated
+                    if not accumulated_text:
+                        yield gr.update(value="❌ No analysis was generated. Please try again.")
+                        
+                except Exception as e:
+                    yield gr.update(value=f"❌ Error during analysis generation: {str(e)}")
+                
+            except Exception as e:
+                yield gr.update(value=f"❌ Error generating final analysis: {str(e)}")
+        
+        # Generate final analysis with custom prompt
         generate_final_btn.click(
-            generate_final_analysis,
-            inputs=[case_input, extraction_state, selected_articles_state],
+            generate_final_analysis_with_custom_prompt,
+            inputs=[case_input, extraction_state, selected_articles_state, analysis_prompt_input],
             outputs=[final_analysis_display]
         )
 

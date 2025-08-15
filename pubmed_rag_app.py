@@ -67,6 +67,96 @@ Examples:
 Output only the disease name. No additional text or formatting.
 """
 
+# Generic final analysis prompt template
+FINAL_ANALYSIS_PROMPT_TEMPLATE = """You are a research analyst synthesizing findings from a comprehensive literature review. Your goal is to provide insights that are valuable for research purposes.
+
+RESEARCH CONTEXT:
+Original Query/Case: {case_description}
+
+Primary Focus: {primary_focus}
+Key Concepts Searched: {key_concepts}
+
+ANALYZED ARTICLES:
+{articles_content}
+
+Based on the research context and analyzed articles above, please provide a comprehensive synthesis in markdown format with the following sections:
+
+## Literature Analysis: {primary_focus}
+
+### 1. Executive Summary
+Provide a concise overview of the key findings from the literature review, highlighting:
+- Main themes identified across the literature
+- Most significant insights relevant to the research query  
+- Overall quality and quantity of available evidence
+- Key takeaways for researchers in this field
+
+### 2. Key Findings by Concept
+| Concept | Articles Discussing | Key Findings | Evidence Quality |
+|---------|-------------------|--------------|------------------|
+[For each key concept searched, summarize what the literature reveals about it]
+
+### 3. Methodological Landscape
+| Research Method | Frequency | Notable Studies | Insights Generated |
+|-----------------|-----------|-----------------|-------------------|
+[Map the research methodologies used across the analyzed articles]
+
+### 4. Temporal Trends
+| Time Period | Research Focus | Key Developments | Paradigm Shifts |
+|-------------|----------------|------------------|-----------------|
+[Analyze how research in this area has evolved over time]
+
+### 5. Cross-Study Patterns
+| Pattern | Supporting Evidence | Implications | Confidence Level |
+|---------|-------------------|--------------|------------------|
+[Identify patterns that appear across multiple studies]
+
+### 6. Controversies & Unresolved Questions
+| Issue | Different Perspectives | Evidence For/Against | Current Consensus |
+|-------|----------------------|---------------------|-------------------|
+[Highlight areas of disagreement or ongoing debate in the literature]
+
+### 7. Knowledge Gaps & Future Research
+| Gap Identified | Why It Matters | Potential Approaches | Expected Impact |
+|----------------|----------------|---------------------|-----------------|
+[Map areas where further research is needed]
+
+### 8. Practical Applications
+Based on the synthesized literature, identify:
+- How these findings can be applied in practice
+- Recommendations for researchers entering this field
+- Tools, methods, or frameworks that emerge from the literature
+- Potential interdisciplinary connections
+
+### 9. Quality & Reliability Assessment
+Evaluate the overall body of literature:
+- **Study Types**: Distribution of research designs (experimental, observational, reviews, etc.)
+- **Sample Characteristics**: Common sample sizes, populations studied
+- **Geographic Distribution**: Where research is being conducted
+- **Publication Patterns**: Journal quality, publication years, citation patterns
+- **Methodological Rigor**: Strengths and limitations observed
+
+### 10. Synthesis & Conclusions
+Provide an integrated narrative that:
+- Connects findings across all analyzed articles
+- Identifies the strongest evidence and most reliable findings
+- Suggests how this research area is likely to develop
+- Offers guidance for stakeholders interested in this topic
+
+### 11. Bibliography
+**Most Relevant Articles** (in order of relevance to the research query):
+[Format each as: Title, Authors, Journal (Year), [PMID: xxxxx](https://pubmed.ncbi.nlm.nih.gov/xxxxx/)]
+
+---
+
+IMPORTANT NOTES:
+- Maintain objectivity and clearly distinguish between strong evidence and preliminary findings
+- Use accessible language while preserving scientific accuracy
+- All claims must be traceable to specific articles in the analysis
+- When evidence is conflicting, present all viewpoints fairly
+- Focus on research insights and knowledge synthesis rather than prescriptive recommendations
+- Highlight both the strengths and limitations of the current literature
+"""
+
 # Events extraction prompt - updated to extract general concepts for better literature matching
 EVENT_EXTRACTION_PROMPT = """You are an expert pediatric oncologist analyzing patient case notes to identify key disease concepts and clinical features for literature search.
 
@@ -927,6 +1017,123 @@ Article content:
         print(f"Error in AI.GENERATE_TABLE analysis: {str(e)}")
         return []
 
+def estimate_tokens(text):
+    """Rough estimate of token count for a text."""
+    # Approximation: 1 token ≈ 4 characters
+    return len(text) // 4
+
+def format_article_for_analysis(article, idx):
+    """Format a single article for the analysis prompt."""
+    metadata = article.get('metadata', article)
+    
+    # Get events found
+    events_found = metadata.get('actionable_events', 'None')
+    if isinstance(events_found, str) and events_found:
+        events_str = events_found
+    else:
+        events_str = "None identified"
+    
+    return f"""
+Article {idx}:
+Title: {metadata.get('title', 'Unknown')}
+Journal: {metadata.get('journal_title', 'Unknown')} | Year: {metadata.get('year', 'N/A')}
+Type: {metadata.get('paper_type', 'Unknown')}
+Score: {article.get('score', 0):.1f}
+Key Concepts Found: {events_str}
+PMID: {article.get('pmid', 'N/A')} | PMCID: {article.get('pmcid', 'N/A')}
+
+Full Text:
+{article.get('content', 'No content available')}
+"""
+
+def create_final_analysis_prompt(case_text, disease, events, selected_articles):
+    """Create the final analysis prompt with full article contents."""
+    
+    if not selected_articles:
+        return None
+    
+    # Sort articles by score
+    sorted_articles = sorted(selected_articles, key=lambda x: x.get('score', 0), reverse=True)
+    
+    # Format all selected articles
+    articles_content_parts = []
+    for idx, article in enumerate(sorted_articles, 1):
+        articles_content_parts.append(format_article_for_analysis(article, idx))
+    
+    # Join all articles with separator
+    articles_content = ("\n" + "="*80 + "\n").join(articles_content_parts)
+    
+    # Fill in the template
+    filled_prompt = FINAL_ANALYSIS_PROMPT_TEMPLATE.format(
+        case_description=case_text,
+        primary_focus=disease,
+        key_concepts=', '.join(events),
+        articles_content=articles_content
+    )
+    
+    return filled_prompt
+
+def generate_final_analysis_stream(case_text, disease, events, selected_articles, genai_client):
+    """Generate final analysis with streaming response."""
+    
+    if not selected_articles:
+        yield "❌ No articles selected. Please select at least one article for analysis."
+        return
+    
+    if not genai_client:
+        yield "❌ Gemini client not initialized. Please complete setup first."
+        return
+    
+    try:
+        # Create the prompt
+        prompt = create_final_analysis_prompt(case_text, disease, events, selected_articles)
+        
+        if not prompt:
+            yield "❌ Could not create analysis prompt."
+            return
+        
+        # Generate content with streaming
+        config = GenerateContentConfig(
+            temperature=0.3,  # Slightly higher for more creative synthesis
+            max_output_tokens=8192,
+            candidate_count=1,
+            thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
+        )
+        
+        # First yield to show we're starting
+        yield "🔄 Generating comprehensive analysis...\n\n"
+        
+        # Stream the response
+        try:
+            response_stream = genai_client.models.generate_content_stream(
+                model=MODEL_ID,
+                contents=[prompt],
+                config=config
+            )
+            
+            # Accumulate the full response for streaming
+            accumulated_text = ""
+            
+            for chunk in response_stream:
+                if hasattr(chunk, 'candidates') and chunk.candidates:
+                    for candidate in chunk.candidates:
+                        if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'text'):
+                                    accumulated_text += part.text
+                                    # Yield the accumulated content so far
+                                    yield accumulated_text
+            
+            # If no content was generated
+            if not accumulated_text:
+                yield "❌ No analysis was generated. Please try again."
+                
+        except Exception as e:
+            yield f"❌ Error during analysis generation: {str(e)}"
+        
+    except Exception as e:
+        yield f"❌ Error generating final analysis: {str(e)}"
+
 def setup_bigquery(project, dataset, client, model_endpoint, progress=gr.Progress()):
     """Setup BigQuery dataset and models with retry logic."""
     progress(0.8, desc="Setting up BigQuery dataset and models (may take a couple minutes if first time)...")
@@ -1095,6 +1302,64 @@ def create_app(share=False):
         font-size: 14px;
         line-height: 1.6;
         color: #212529 !important;  /* Black text for readability */
+    }
+    .final-analysis-display {
+        background-color: #ffffff;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        padding: 30px;
+        margin: 20px 0;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        line-height: 1.8;
+        color: #212529;
+        max-height: 800px;
+        overflow-y: auto;
+    }
+    .final-analysis-display h2 {
+        color: #0066cc;
+        border-bottom: 2px solid #0066cc;
+        padding-bottom: 10px;
+        margin-top: 30px;
+        margin-bottom: 20px;
+    }
+    .final-analysis-display h3 {
+        color: #333;
+        margin-top: 25px;
+        margin-bottom: 15px;
+    }
+    .final-analysis-display table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 20px 0;
+        background-color: #fff;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .final-analysis-display th {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        padding: 12px;
+        text-align: left;
+        font-weight: bold;
+        color: #495057;
+    }
+    .final-analysis-display td {
+        border: 1px solid #dee2e6;
+        padding: 10px;
+        vertical-align: top;
+    }
+    .final-analysis-display a {
+        color: #0066cc;
+        text-decoration: none;
+    }
+    .final-analysis-display a:hover {
+        text-decoration: underline;
+    }
+    .final-analysis-display ul, .final-analysis-display ol {
+        margin: 10px 0;
+        padding-left: 30px;
+    }
+    .final-analysis-display li {
+        margin: 5px 0;
     }
     """
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="sky"), css=css) as demo:
@@ -1417,12 +1682,60 @@ def create_app(share=False):
                 with gr.Accordion("Detailed Analysis", open=True) as analysis_accordion:
                     detailed_analysis_html = gr.HTML()
                 
-                # Final summary
-                analysis_summary = gr.Markdown(visible=False)
-                
                 # State to track results
                 results_state = gr.State([])
                 analysis_active = gr.State(False)
+                
+                # Final Analysis Button - appears after analysis (replaces summary)
+                with gr.Row():
+                    # Empty column for centering
+                    gr.Column()
+                    with gr.Column(scale=2):
+                        final_analysis_btn = gr.Button("Proceed to Final Analysis", variant="primary", visible=False)
+                    gr.Column()
+
+            with gr.TabItem("5. Final Analysis", id=5):
+                gr.Markdown("## Final Analysis")
+                gr.Markdown("*Select articles to include in the comprehensive synthesis, then generate the final analysis.*")
+                
+                # Article selection section
+                with gr.Column():
+                    gr.Markdown("### Select Articles for Analysis")
+                    
+                    # Selection controls
+                    with gr.Row():
+                        select_all_btn = gr.Button("Select All", size="sm")
+                        deselect_all_btn = gr.Button("Deselect All", size="sm")
+                        selected_count = gr.Markdown("0 articles selected")
+                        token_estimate = gr.Markdown("Estimated tokens: 0")
+                    
+                    # Article checkboxes (will be populated dynamically)
+                    article_selections = gr.CheckboxGroup(
+                        label="",
+                        choices=[],
+                        value=[],
+                        elem_id="article_selections"
+                    )
+                    
+                    # Generate button
+                    generate_final_btn = gr.Button(
+                        "Generate Final Analysis", 
+                        variant="primary", 
+                        interactive=False
+                    )
+                
+                gr.Markdown("---")
+                
+                # Analysis display section
+                with gr.Column():
+                    final_analysis_progress = gr.Markdown("")
+                    final_analysis_display = gr.Markdown(
+                        "", 
+                        elem_classes="final-analysis-display"
+                    )
+                
+                # State to track selected articles
+                selected_articles_state = gr.State([])
 
         # --- Event Handlers for UI ---
         def initialize_credentials_and_proceed():
@@ -2497,12 +2810,15 @@ def create_app(share=False):
                 else:
                     summary += "\n\n⚠️ No articles were successfully analyzed. This may be due to API quota limits or processing errors."
                 
+                # Debug log
+                print(f"DEBUG: Analysis complete with {len(articles)} articles")
+                
                 return [
                     articles,
                     gr.update(value=progress_data.get("message", "")),
                     gr.update(value=display_df),
                     gr.update(value=detailed_html),
-                    gr.update(visible=True, value=summary),
+                    gr.update(visible=True),  # Show final_analysis_btn
                     gr.update(visible=False),
                     False
                 ]
@@ -2650,7 +2966,7 @@ def create_app(share=False):
         ).then(
             run_full_analysis_two_phase,
             inputs=[case_input, analysis_config, persona_text, criteria_state, extraction_state],
-            outputs=[results_state, analysis_progress, event_coverage_display, live_results_df, detailed_analysis_html, analysis_summary, stop_analysis_btn, analysis_active]
+            outputs=[results_state, analysis_progress, event_coverage_display, live_results_df, detailed_analysis_html, final_analysis_btn, stop_analysis_btn, analysis_active]
         )
         
         # Stop button handler
@@ -2665,6 +2981,125 @@ def create_app(share=False):
         stop_analysis_btn.click(
             stop_analysis,
             outputs=[analysis_active, analysis_progress, stop_analysis_btn]
+        )
+        
+        # Final Analysis tab handlers
+        def prepare_final_analysis_tab(results):
+            """Prepare the final analysis tab with article selection."""
+            if not results:
+                return (
+                    gr.update(choices=[], value=[]),  # article_selections
+                    gr.update(value="No articles available"),  # selected_count
+                    gr.update(value="Estimated tokens: 0"),  # token_estimate
+                    gr.update(interactive=False),  # generate_final_btn
+                    [],  # selected_articles_state
+                    gr.update(visible=False)  # final_analysis_btn
+                )
+            
+            # Create choices for checkbox group
+            choices = []
+            for idx, article in enumerate(results):
+                metadata = article.get('metadata', article)
+                choice_label = f"[Score: {article.get('score', 0):.1f}] {metadata.get('title', 'Unknown')[:100]}... ({metadata.get('journal_title', 'Unknown')}, {metadata.get('year', 'N/A')})"
+                choices.append((choice_label, idx))
+            
+            # Select top 10 by default
+            default_selected = list(range(min(10, len(results))))
+            
+            # Calculate initial token estimate
+            selected_articles = [results[i] for i in default_selected]
+            total_tokens = sum(estimate_tokens(article.get('content', '')) for article in selected_articles)
+            
+            return (
+                gr.update(choices=choices, value=default_selected),  # article_selections
+                gr.update(value=f"{len(default_selected)} articles selected"),  # selected_count
+                gr.update(value=f"Estimated tokens: {total_tokens:,}"),  # token_estimate
+                gr.update(interactive=len(default_selected) > 0),  # generate_final_btn
+                selected_articles,  # selected_articles_state
+                gr.update(visible=True)  # final_analysis_btn
+            )
+        
+        def update_article_selection(selected_indices, all_results):
+            """Update selection count and token estimate."""
+            if not all_results or selected_indices is None:
+                return (
+                    gr.update(value="0 articles selected"),
+                    gr.update(value="Estimated tokens: 0"),
+                    gr.update(interactive=False),
+                    []
+                )
+            
+            selected_articles = [all_results[i] for i in selected_indices]
+            total_tokens = sum(estimate_tokens(article.get('content', '')) for article in selected_articles)
+            
+            return (
+                gr.update(value=f"{len(selected_indices)} articles selected"),
+                gr.update(value=f"Estimated tokens: {total_tokens:,}"),
+                gr.update(interactive=len(selected_indices) > 0),
+                selected_articles
+            )
+        
+        def select_all_articles(all_results):
+            """Select all articles."""
+            if not all_results:
+                return gr.update()
+            return gr.update(value=list(range(len(all_results))))
+        
+        def deselect_all_articles():
+            """Deselect all articles."""
+            return gr.update(value=[])
+        
+        def generate_final_analysis(case_text, extraction_state, selected_articles):
+            """Generate the final analysis with streaming."""
+            if not selected_articles:
+                yield gr.update(value="❌ Please select at least one article.")
+                return
+            
+            # Extract disease and events
+            disease = extraction_state.get('disease', '')
+            events = extraction_state.get('events_list', [])
+            
+            # Stream the analysis
+            yield gr.update(value="🔄 Generating comprehensive analysis...")
+            
+            accumulated_text = ""
+            for chunk in generate_final_analysis_stream(case_text, disease, events, selected_articles, genai_client):
+                accumulated_text = chunk
+                yield gr.update(value=accumulated_text)
+        
+        # Connect final analysis button to switch tabs and prepare selection
+        final_analysis_btn.click(
+            lambda results: prepare_final_analysis_tab(results),
+            inputs=[results_state],
+            outputs=[article_selections, selected_count, token_estimate, generate_final_btn, selected_articles_state, final_analysis_btn]
+        ).then(
+            lambda: gr.update(selected=5),
+            outputs=[tabs]
+        )
+        
+        # Update selection handlers
+        article_selections.change(
+            update_article_selection,
+            inputs=[article_selections, results_state],
+            outputs=[selected_count, token_estimate, generate_final_btn, selected_articles_state]
+        )
+        
+        select_all_btn.click(
+            select_all_articles,
+            inputs=[results_state],
+            outputs=[article_selections]
+        )
+        
+        deselect_all_btn.click(
+            deselect_all_articles,
+            outputs=[article_selections]
+        )
+        
+        # Generate final analysis
+        generate_final_btn.click(
+            generate_final_analysis,
+            inputs=[case_input, extraction_state, selected_articles_state],
+            outputs=[final_analysis_display]
         )
 
         # Initial load

@@ -1,0 +1,413 @@
+### 12. Final Analysis with Custom Prompt Templates
+
+This section allows you to generate a comprehensive synthesis of the analyzed articles with customizable prompts.
+
+```python
+# Final Analysis Prompt Template
+FINAL_ANALYSIS_PROMPT_TEMPLATE = """You are a research analyst synthesizing findings from a comprehensive literature review. Your goal is to provide insights that are valuable for research purposes.
+
+RESEARCH CONTEXT:
+Original Query/Case: {case_description}
+
+Primary Focus: {primary_focus}
+Key Concepts Searched: {key_concepts}
+
+ANALYZED ARTICLES:
+{articles_content}
+
+Based on the research context and analyzed articles above, please provide a comprehensive synthesis in markdown format with the following sections:
+
+## Literature Analysis: {primary_focus}
+
+### 1. Executive Summary
+Provide a concise overview of the key findings from the literature review, highlighting:
+- Main themes identified across the literature
+- Most significant insights relevant to the research query  
+- Overall quality and quantity of available evidence
+- Key takeaways for researchers in this field
+
+### 2. Key Findings by Concept
+| Concept | Articles Discussing | Key Findings | Evidence Quality |
+|---------|-------------------|--------------|------------------|
+[For each key concept searched, summarize what the literature reveals about it]
+
+### 3. Methodological Landscape
+| Research Method | Frequency | Notable Studies | Insights Generated |
+|-----------------|-----------|-----------------|-------------------|
+[Map the research methodologies used across the analyzed articles]
+
+### 4. Temporal Trends
+| Time Period | Research Focus | Key Developments | Paradigm Shifts |
+|-------------|----------------|------------------|-----------------|
+[Analyze how research in this area has evolved over time]
+
+### 5. Cross-Study Patterns
+| Pattern | Supporting Evidence | Implications | Confidence Level |
+|---------|-------------------|--------------|------------------|
+[Identify patterns that appear across multiple studies]
+
+### 6. Controversies & Unresolved Questions
+| Issue | Different Perspectives | Evidence For/Against | Current Consensus |
+|-------|----------------------|---------------------|-------------------|
+[Highlight areas of disagreement or ongoing debate in the literature]
+
+### 7. Knowledge Gaps & Future Research
+| Gap Identified | Why It Matters | Potential Approaches | Expected Impact |
+|----------------|----------------|---------------------|-----------------|
+[Map areas where further research is needed]
+
+### 8. Practical Applications
+Based on the synthesized literature, identify:
+- How these findings can be applied in practice
+- Recommendations for researchers entering this field
+- Tools, methods, or frameworks that emerge from the literature
+- Potential interdisciplinary connections
+
+### 9. Quality & Reliability Assessment
+Evaluate the overall body of literature:
+- **Study Types**: Distribution of research designs (experimental, observational, reviews, etc.)
+- **Sample Characteristics**: Common sample sizes, populations studied
+- **Geographic Distribution**: Where research is being conducted
+- **Publication Patterns**: Journal quality, publication years, citation patterns
+- **Methodological Rigor**: Strengths and limitations observed
+
+### 10. Synthesis & Conclusions
+Provide an integrated narrative that:
+- Connects findings across all analyzed articles
+- Identifies the strongest evidence and most reliable findings
+- Suggests how this research area is likely to develop
+- Offers guidance for stakeholders interested in this topic
+
+### 11. Bibliography
+**Most Relevant Articles** (in order of relevance to the research query):
+[Format each as: Title, Authors, Journal (Year), [PMID: xxxxx](https://pubmed.ncbi.nlm.nih.gov/xxxxx/)]
+
+---
+
+IMPORTANT NOTES:
+- Maintain objectivity and clearly distinguish between strong evidence and preliminary findings
+- Use accessible language while preserving scientific accuracy
+- All claims must be traceable to specific articles in the analysis
+- When evidence is conflicting, present all viewpoints fairly
+- Focus on research insights and knowledge synthesis rather than prescriptive recommendations
+- Highlight both the strengths and limitations of the current literature
+"""
+```
+
+```python
+class ArticleSelector:
+    """Widget for selecting articles to include in final analysis."""
+    
+    def __init__(self, articles_df):
+        self.articles_df = articles_df
+        self.selected_indices = []
+        
+        # Create checkboxes for each article
+        self.checkboxes = []
+        for idx, (_, article) in enumerate(articles_df.iterrows()):
+            label = f"[Score: {article['score']:.1f}] {article.get('title', 'Unknown')[:80]}..."
+            checkbox = widgets.Checkbox(
+                value=idx < 5,  # Select top 5 by default
+                description=label,
+                layout=widgets.Layout(width='100%'),
+                style={'description_width': 'initial'}
+            )
+            self.checkboxes.append(checkbox)
+        
+        # Create control buttons
+        self.select_all_btn = widgets.Button(
+            description='Select All',
+            button_style='success',
+            icon='check-square'
+        )
+        self.select_none_btn = widgets.Button(
+            description='Select None',
+            button_style='warning',
+            icon='square'
+        )
+        
+        self.select_all_btn.on_click(lambda b: self._select_all())
+        self.select_none_btn.on_click(lambda b: self._select_none())
+        
+        # Token estimate display
+        self.token_display = widgets.HTML(value=self._estimate_tokens())
+        
+        # Update token estimate when selection changes
+        for checkbox in self.checkboxes:
+            checkbox.observe(lambda change: self._update_token_estimate(), names='value')
+    
+    def _select_all(self):
+        """Select all articles."""
+        for checkbox in self.checkboxes:
+            checkbox.value = True
+    
+    def _select_none(self):
+        """Deselect all articles."""
+        for checkbox in self.checkboxes:
+            checkbox.value = False
+    
+    def _estimate_tokens(self):
+        """Estimate tokens for selected articles."""
+        selected_count = sum(1 for cb in self.checkboxes if cb.value)
+        # Rough estimate: ~1000 tokens per article content
+        estimated_tokens = selected_count * 1000
+        return f"<b>Estimated tokens:</b> ~{estimated_tokens:,} (Selected: {selected_count} articles)"
+    
+    def _update_token_estimate(self):
+        """Update token estimate display."""
+        self.token_display.value = self._estimate_tokens()
+    
+    def get_selected_articles(self):
+        """Get list of selected articles."""
+        selected = []
+        for idx, checkbox in enumerate(self.checkboxes):
+            if checkbox.value and idx < len(self.articles_df):
+                selected.append(self.articles_df.iloc[idx])
+        return selected
+    
+    def display(self):
+        """Display the article selector interface."""
+        display(widgets.VBox([
+            widgets.HTML('<h4>Select Articles for Final Analysis</h4>'),
+            widgets.HBox([self.select_all_btn, self.select_none_btn]),
+            self.token_display,
+            widgets.VBox(self.checkboxes, 
+                        layout=widgets.Layout(
+                            max_height='400px', 
+                            overflow_y='auto',
+                            border='1px solid #ddd',
+                            padding='10px'
+                        ))
+        ]))
+```
+
+```python
+def format_article_for_analysis(article, idx):
+    """Format a single article for the analysis prompt."""
+    metadata = article.to_dict() if hasattr(article, 'to_dict') else article
+    
+    # Get events found
+    events_found = metadata.get('actionable_events', 'None')
+    if isinstance(events_found, list):
+        events_str = ", ".join([e.get('event', '') for e in events_found if isinstance(e, dict)])
+    elif isinstance(events_found, str):
+        events_str = events_found
+    else:
+        events_str = "None identified"
+    
+    return f"""
+Article {idx}:
+Title: {metadata.get('title', 'Unknown')}
+Journal: {metadata.get('journal_title', 'Unknown')} | Year: {metadata.get('year', 'N/A')}
+Type: {metadata.get('paper_type', 'Unknown')}
+Score: {metadata.get('score', 0):.1f}
+Key Concepts Found: {events_str}
+PMID: {metadata.get('pmid', 'N/A')} | PMCID: {metadata.get('pmcid', 'N/A')}
+
+Full Text:
+{metadata.get('content', 'No content available')}
+"""
+
+def create_final_analysis_prompt(case_text, disease, events, selected_articles, custom_template=None):
+    """Create the final analysis prompt with full article contents."""
+    
+    if not selected_articles:
+        return None
+    
+    # Use custom template or default
+    template = custom_template or FINAL_ANALYSIS_PROMPT_TEMPLATE
+    
+    # Sort articles by score
+    sorted_articles = sorted(selected_articles, 
+                           key=lambda x: x.get('score', 0) if hasattr(x, 'get') else x['score'], 
+                           reverse=True)
+    
+    # Format all selected articles
+    articles_content_parts = []
+    for idx, article in enumerate(sorted_articles, 1):
+        articles_content_parts.append(format_article_for_analysis(article, idx))
+    
+    # Join all articles with separator
+    articles_content = ("\n" + "="*80 + "\n").join(articles_content_parts)
+    
+    # Fill in the template
+    filled_prompt = template.format(
+        case_description=case_text,
+        primary_focus=disease,
+        key_concepts=', '.join(events),
+        articles_content=articles_content
+    )
+    
+    return filled_prompt
+
+def generate_final_analysis(case_text, disease, events, selected_articles, genai_client, custom_template=None):
+    """Generate final analysis with optional custom template."""
+    
+    if not selected_articles:
+        return "❌ No articles selected. Please select at least one article for analysis."
+    
+    if not genai_client:
+        return "❌ Gemini client not initialized. Please complete setup first."
+    
+    try:
+        # Create the prompt
+        prompt = create_final_analysis_prompt(case_text, disease, events, selected_articles, custom_template)
+        
+        if not prompt:
+            return "❌ Could not create analysis prompt."
+        
+        # Generate content
+        config = GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=8192,
+            candidate_count=1,
+            thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
+        )
+        
+        print("🔄 Generating comprehensive analysis...")
+        
+        response = genai_client.models.generate_content(
+            model=MODEL_ID,
+            contents=[prompt],
+            config=config
+        )
+        
+        return response.text
+        
+    except Exception as e:
+        return f"❌ Error generating final analysis: {str(e)}"
+```
+
+```python
+class FinalAnalysisInterface:
+    """Complete interface for final analysis generation."""
+    
+    def __init__(self, results, genai_client):
+        self.results = results
+        self.genai_client = genai_client
+        self.articles_df = results['articles']
+        
+        # Article selector
+        self.article_selector = ArticleSelector(self.articles_df)
+        
+        # Prompt template editor
+        self.template_editor = widgets.Textarea(
+            value=FINAL_ANALYSIS_PROMPT_TEMPLATE,
+            placeholder='Enter your custom analysis template...',
+            description='Analysis Template:',
+            layout=widgets.Layout(width='100%', height='300px'),
+            style={'description_width': 'initial'}
+        )
+        
+        # Template examples
+        self.template_examples = {
+            "Default": FINAL_ANALYSIS_PROMPT_TEMPLATE,
+            "Clinical Focus": """You are a clinical researcher synthesizing findings for medical practice.
+
+CASE: {case_description}
+DISEASE: {primary_focus}
+KEY FACTORS: {key_concepts}
+
+ANALYZED ARTICLES:
+{articles_content}
+
+Please provide a clinical synthesis with these sections:
+
+## Clinical Summary: {primary_focus}
+
+### Key Clinical Findings
+- Summarize the most clinically relevant findings
+- Focus on treatment efficacy and safety
+- Highlight patient outcomes
+
+### Treatment Recommendations
+| Treatment | Evidence Level | Success Rate | Side Effects |
+|-----------|---------------|--------------|--------------|
+[Analyze treatments from the articles]
+
+### Clinical Pearls
+- List key takeaways for clinicians
+- Include dosing considerations
+- Note any contraindications
+
+### Future Directions
+- Identify gaps in clinical knowledge
+- Suggest areas for clinical trials
+""",
+            "Research Focus": FINAL_ANALYSIS_PROMPT_TEMPLATE
+        }
+        
+        self.template_dropdown = widgets.Dropdown(
+            options=list(self.template_examples.keys()),
+            value='Default',
+            description='Load Template:',
+            style={'description_width': 'initial'}
+        )
+        
+        self.template_dropdown.observe(self._load_template, names='value')
+        
+        # Generate button
+        self.generate_btn = widgets.Button(
+            description='Generate Final Analysis',
+            button_style='primary',
+            icon='file-text',
+            layout=widgets.Layout(width='200px')
+        )
+        
+        self.generate_btn.on_click(self._generate_analysis)
+        
+        # Output area
+        self.output = widgets.Output()
+    
+    def _load_template(self, change):
+        """Load selected template example."""
+        self.template_editor.value = self.template_examples[change['new']]
+    
+    def _generate_analysis(self, b):
+        """Generate the final analysis."""
+        with self.output:
+            clear_output(wait=True)
+            
+            # Get selected articles
+            selected_articles = self.article_selector.get_selected_articles()
+            
+            if not selected_articles:
+                display(HTML('<div style="color: red;">❌ Please select at least one article.</div>'))
+                return
+            
+            # Generate analysis
+            analysis = generate_final_analysis(
+                self.results['case_text'],
+                self.results['disease'],
+                self.results['events'],
+                selected_articles,
+                self.genai_client,
+                self.template_editor.value
+            )
+            
+            # Display results
+            display(HTML('<h3>📊 Final Analysis</h3>'))
+            display(Markdown(analysis))
+    
+    def display(self):
+        """Display the complete interface."""
+        display(widgets.VBox([
+            widgets.HTML('<h3>🎯 Final Analysis Generation</h3>'),
+            widgets.HTML('<p><i>Select articles and customize the analysis template to generate a comprehensive synthesis.</i></p>'),
+            
+            # Article selection
+            self.article_selector.display(),
+            
+            widgets.HTML('<hr>'),
+            
+            # Template customization
+            widgets.HTML('<h4>Customize Analysis Template</h4>'),
+            self.template_dropdown,
+            self.template_editor,
+            
+            # Generate button
+            widgets.HBox([self.generate_btn]),
+            
+            # Output
+            self.output
+        ]))

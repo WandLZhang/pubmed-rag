@@ -4,51 +4,6 @@ This repository contains notebooks and resources that demonstrate how to build R
 
 The project converts the user experience from the [Capricorn Medical Research Application](https://capricorn-medical-research.web.app/) into interactive Colab notebooks, making it accessible for both clinicians and data scientists.
 
-## Examples
-
-<!-- markdownlint-disable MD033 -->
-<table>
-  <tr>
-    <th style="text-align: center;">Notebook</th>
-    <th style="text-align: center;">Target Audience</th>
-    <th style="text-align: center;">Description</th>
-    <th style="text-align: center;">Key Features</th>
-  </tr>
-  <tr>
-    <td>
-      <a href="PubMed_RAG_Clinician_Example.ipynb"><code>Clinician Example</code></a>
-    </td>
-    <td>Healthcare Professionals</td>
-    <td>
-      Interactive Gradio app for medical literature analysis without coding
-    </td>
-    <td>
-      • No-code interface<br>
-      • Case note analysis<br>
-      • Customizable scoring<br>
-      • Final synthesis generation<br>
-      • Two-phase progressive search
-    </td>
-  </tr>
-  <tr>
-    <td>
-      <a href="PubMed_RAG_Data_Scientist_Example.ipynb"><code>Data Scientist Example</code></a>
-    </td>
-    <td>Researchers & Developers</td>
-    <td>
-      Complete code pipeline for building custom medical RAG applications
-    </td>
-    <td>
-      • Full Python implementation<br>
-      • Customizable prompts<br>
-      • Dynamic scoring system<br>
-      • Interactive visualizations<br>
-      • Medical Q&A chat
-    </td>
-  </tr>
-</table>
-<!-- markdownlint-enable MD033 -->
-
 ## Quick Start Guide
 
 ### 🚀 For Clinicians (No Coding Required)

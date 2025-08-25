@@ -2,10 +2,6 @@
 
 This repository contains notebooks and resources that demonstrate how to build RAG (Retrieval-Augmented Generation) applications for medical literature analysis using Google Cloud BigQuery vector search and Vertex AI Gemini models.
 
-## Overview
-
-[PubMed RAG](https://github.com/google/pubmed-rag) provides a complete pipeline for analyzing medical cases against PubMed literature using advanced AI capabilities. This repository demonstrates how to extract medical information from case notes, search relevant PubMed articles using vector similarity, score and rank articles with customizable criteria, and generate evidence-based analyses with proper citations.
-
 The project converts the user experience from the [Capricorn Medical Research Application](https://capricorn-medical-research.web.app/) into interactive Colab notebooks, making it accessible for both clinicians and data scientists.
 
 ## Examples

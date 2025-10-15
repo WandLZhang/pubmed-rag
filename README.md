@@ -40,7 +40,7 @@ The project converts the user experience from the [Capricorn Medical Research Ap
 
 ## Architecture
 
-![Medical Literature Analysis Architecture](https://github.com/WandLZhang/pubmed-rag/blob/main/visuals/1.png?raw=true)
+![Medical Literature Analysis Architecture](https://github.com/google/pubmed-rag/blob/main/visuals/1.png?raw=true)
 
 ## Contributing
 

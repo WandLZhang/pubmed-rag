@@ -50,19 +50,6 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for details.
 
 Apache 2.0; see [`LICENSE`](LICENSE) for details.
 
-## Citation
-
-If you use this work in your research, please cite:
-
-```bibtex
-@software{pubmed_rag_2025,
-  author = {Zhang, Willis and Jiang, Stone},
-  title = {PubMed RAG: Medical Literature Analysis with BigQuery and Gemini},
-  year = {2025},
-  url = {https://github.com/google/pubmed-rag}
-}
-```
-
 ## Disclaimer
 
 This project is not an official Google project. It is not supported by
